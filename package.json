@@ -1,14 +1,12 @@
 {
-  "name": "claude-agent-sdk-pi",
-  "version": "1.0.16",
+  "name": "pi-claude-code-acp",
+  "version": "0.1.0",
   "keywords": [
     "pi-package"
   ],
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.32",
-    "@anthropic-ai/sdk": "^0.73.0",
-    "change-case": "^5.4.4"
+    "@agentclientprotocol/sdk": "^0.16.1"
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "^0.52.0",

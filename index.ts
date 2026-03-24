@@ -1,13 +1,14 @@
-import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
-import { AuthStorage, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
-import { pascalCase } from "change-case";
-import { existsSync, readFileSync } from "fs";
-import { homedir } from "os";
-import { dirname, join, relative, resolve } from "path";
+import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION, type SessionNotification, type SessionUpdate, type ToolCall, type ToolCallUpdate, type RequestPermissionRequest, type RequestPermissionResponse, type ReadTextFileRequest, type ReadTextFileResponse, type WriteTextFileRequest, type WriteTextFileResponse, type CreateTerminalRequest, type CreateTerminalResponse, type TerminalOutputRequest, type TerminalOutputResponse, type WaitForTerminalExitRequest, type WaitForTerminalExitResponse, type KillTerminalRequest, type KillTerminalResponse, type ReleaseTerminalRequest, type ReleaseTerminalResponse } from "@agentclientprotocol/sdk";
+import { spawn, type ChildProcess } from "node:child_process";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, relative, resolve } from "node:path";
+import { Writable, Readable } from "node:stream";
 
-const PROVIDER_ID = "claude-agent-sdk";
+const PROVIDER_ID = "claude-code-acp";
 
 const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 	read: "read",
@@ -28,12 +29,7 @@ const PI_TO_SDK_TOOL_NAME: Record<string, string> = {
 	glob: "Glob",
 };
 
-const DEFAULT_TOOLS = ["Read", "Write", "Edit", "Bash", "Grep", "Glob"];
-
 const BUILTIN_TOOL_NAMES = new Set(Object.keys(PI_TO_SDK_TOOL_NAME));
-const TOOL_EXECUTION_DENIED_MESSAGE = "Tool execution is unavailable in this environment.";
-const MCP_SERVER_NAME = "custom-tools";
-const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 
 const SKILLS_ALIAS_GLOBAL = "~/.claude/skills";
 const SKILLS_ALIAS_PROJECT = ".claude/skills";
@@ -43,131 +39,88 @@ const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
 const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
 
-const MODELS = getModels("anthropic").map((model) => ({
-	id: model.id,
-	name: model.name,
-	reasoning: model.reasoning,
-	input: model.input,
-	cost: model.cost,
-	contextWindow: model.contextWindow,
-	maxTokens: model.maxTokens,
-}));
+const LATEST_MODEL_IDS = new Set(["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]);
 
+const MODELS = getModels("anthropic")
+	.filter((model) => LATEST_MODEL_IDS.has(model.id))
+	.map((model) => ({
+		id: model.id,
+		name: model.name,
+		reasoning: model.reasoning,
+		input: model.input,
+		cost: model.cost,
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+	}));
 
-function buildPromptBlocks(
+type SettingSource = "user" | "project" | "local";
+
+type ProviderSettings = {
+	appendSystemPrompt?: boolean;
+	settingSources?: SettingSource[];
+	strictMcpConfig?: boolean;
+};
+
+// --- Prompt building ---
+
+function buildPromptText(
 	context: Context,
-	customToolNameToSdk: Map<string, string> | undefined,
-): ContentBlockParam[] {
-	const blocks: ContentBlockParam[] = [];
+	systemPromptAppend?: string,
+): string {
+	const parts: string[] = [];
 
-	const pushText = (text: string) => {
-		blocks.push({ type: "text", text });
-	};
-
-	const pushImage = (image: ImageContent) => {
-		blocks.push({
-			type: "image",
-			source: {
-				type: "base64",
-				media_type: image.mimeType as Base64ImageSource["media_type"],
-				data: image.data,
-			},
-		});
-	};
-
-	const pushPrefix = (label: string) => {
-		const prefix = `${blocks.length ? "\n\n" : ""}${label}\n`;
-		pushText(prefix);
-	};
-
-	const appendContentBlocks = (
-		content:
-			| string
-			| Array<{
-					type: string;
-					text?: string;
-					data?: string;
-					mimeType?: string;
-				}>,
-	): boolean => {
-		if (typeof content === "string") {
-			if (content.length > 0) {
-				pushText(content);
-				return content.trim().length > 0;
-			}
-			return false;
-		}
-		if (!Array.isArray(content)) return false;
-		let hasText = false;
-		for (const block of content) {
-			if (block.type === "text") {
-				const text = block.text ?? "";
-				if (text.trim().length > 0) hasText = true;
-				pushText(text);
-				continue;
-			}
-			if (block.type === "image") {
-				pushImage(block as ImageContent);
-				continue;
-			}
-			pushText(`[${block.type}]`);
-		}
-		return hasText;
-	};
+	if (systemPromptAppend) {
+		parts.push(systemPromptAppend);
+	}
 
 	for (const message of context.messages) {
 		if (message.role === "user") {
-			pushPrefix("USER:");
-			const hasText = appendContentBlocks(message.content);
-			if (!hasText) {
-				pushText("(see attached image)");
-			}
+			const text = messageContentToText(message.content);
+			parts.push(`USER:\n${text || "(see attached image)"}`);
 			continue;
 		}
 
 		if (message.role === "assistant") {
-			pushPrefix("ASSISTANT:");
-			const text = contentToText(message.content, customToolNameToSdk);
+			const text = assistantContentToText(message.content);
 			if (text.length > 0) {
-				pushText(text);
+				parts.push(`ASSISTANT:\n${text}`);
 			}
 			continue;
 		}
 
 		if (message.role === "toolResult") {
-			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}):`;
-			pushPrefix(header);
-			const hasText = appendContentBlocks(message.content);
-			if (!hasText) {
-				pushText("(see attached image)");
-			}
+			const header = `TOOL RESULT (historical ${message.toolName ?? "unknown"}):`;
+			const text = messageContentToText(message.content);
+			parts.push(`${header}\n${text || "(see attached image)"}`);
 		}
 	}
 
-	if (!blocks.length) return [{ type: "text", text: "" }];
-
-	return blocks;
+	return parts.join("\n\n") || "";
 }
 
-function buildPromptStream(promptBlocks: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
-	async function* generator() {
-		const message: SDKUserMessage = {
-			type: "user",
-			message: {
-				role: "user",
-				content: promptBlocks,
-			} as MessageParam,
-			parent_tool_use_id: null,
-			session_id: "prompt",
-		};
-
-		yield message;
+function messageContentToText(
+	content:
+		| string
+		| Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const textParts: string[] = [];
+	let hasText = false;
+	for (const block of content) {
+		if (block.type === "text" && block.text) {
+			textParts.push(block.text);
+			hasText = true;
+		} else if (block.type === "image") {
+			// text-only for v1
+		} else {
+			textParts.push(`[${block.type}]`);
+		}
 	}
-
-	return generator();
+	return hasText ? textParts.join("\n") : "";
 }
 
-function contentToText(
+function assistantContentToText(
 	content:
 		| string
 		| Array<{
@@ -177,7 +130,6 @@ function contentToText(
 			name?: string;
 			arguments?: Record<string, unknown>;
 		}>,
-	customToolNameToSdk?: Map<string, string>,
 ): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
@@ -187,57 +139,72 @@ function contentToText(
 			if (block.type === "thinking") return block.thinking ?? "";
 			if (block.type === "toolCall") {
 				const args = block.arguments ? JSON.stringify(block.arguments) : "{}";
-				const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
-				return `Historical tool call (non-executable): ${toolName} args=${args}`;
+				return `Historical tool call (non-executable): ${block.name} args=${args}`;
 			}
 			return `[${block.type}]`;
 		})
 		.join("\n");
 }
 
-function mapPiToolNameToSdk(name?: string, customToolNameToSdk?: Map<string, string>): string {
-	if (!name) return "";
+// --- Tool name/arg mapping (kept for mapping ACP tool titles back to pi names) ---
+
+function mapToolName(name: string): string {
 	const normalized = name.toLowerCase();
-	if (customToolNameToSdk) {
-		const mapped = customToolNameToSdk.get(name) ?? customToolNameToSdk.get(normalized);
-		if (mapped) return mapped;
+	const builtin = SDK_TO_PI_TOOL_NAME[normalized];
+	if (builtin) return builtin;
+	return name;
+}
+
+function mapToolArgs(
+	toolName: string,
+	args: Record<string, unknown> | undefined,
+	allowSkillAliasRewrite = true,
+): Record<string, unknown> {
+	const normalized = toolName.toLowerCase();
+	const input = args ?? {};
+	const resolvePath = (value: unknown) => (allowSkillAliasRewrite ? rewriteSkillAliasPath(value) : value);
+
+	switch (normalized) {
+		case "read":
+			return {
+				path: resolvePath(input.file_path ?? input.path),
+				offset: input.offset,
+				limit: input.limit,
+			};
+		case "write":
+			return {
+				path: resolvePath(input.file_path ?? input.path),
+				content: input.content,
+			};
+		case "edit":
+			return {
+				path: resolvePath(input.file_path ?? input.path),
+				oldText: input.old_string ?? input.oldText ?? input.old_text,
+				newText: input.new_string ?? input.newText ?? input.new_text,
+			};
+		case "bash":
+			return {
+				command: input.command,
+				timeout: input.timeout,
+			};
+		case "grep":
+			return {
+				pattern: input.pattern,
+				path: resolvePath(input.path),
+				glob: input.glob,
+				limit: input.head_limit ?? input.limit,
+			};
+		case "find":
+			return {
+				pattern: input.pattern,
+				path: resolvePath(input.path),
+			};
+		default:
+			return input;
 	}
-	if (PI_TO_SDK_TOOL_NAME[normalized]) return PI_TO_SDK_TOOL_NAME[normalized];
-	return pascalCase(name);
 }
 
-type ProviderSettings = {
-	appendSystemPrompt?: boolean;
-
-	/**
-	 * Controls which filesystem-based configuration sources the SDK loads settings from
-	 * (maps to Claude Code CLI --setting-sources)
-	 *
-	 * - "user"    => ~/.claude (or CLAUDE_CONFIG_DIR)
-	 * - "project" => .claude in the current repo
-	 * - "local"   => .claude/settings.local.json in the current repo
-	 */
-	settingSources?: SettingSource[];
-
-	/**
-	 * When true, pass Claude Code CLI --strict-mcp-config to ignore MCP servers from ~/.claude.json
-	 * and project .mcp.json files. This prevents Claude Code from auto-injecting large MCP tool
-	 * schemas (a major token cost) when appendSystemPrompt=false.
-	 */
-	strictMcpConfig?: boolean;
-};
-
-function extractSkillsAppend(systemPrompt?: string): string | undefined {
-	if (!systemPrompt) return undefined;
-	const startMarker = "The following skills provide specialized instructions for specific tasks.";
-	const endMarker = "</available_skills>";
-	const startIndex = systemPrompt.indexOf(startMarker);
-	if (startIndex === -1) return undefined;
-	const endIndex = systemPrompt.indexOf(endMarker, startIndex);
-	if (endIndex === -1) return undefined;
-	const skillsBlock = systemPrompt.slice(startIndex, endIndex + endMarker.length).trim();
-	return rewriteSkillsLocations(skillsBlock);
-}
+// --- Settings & config ---
 
 function loadProviderSettings(): ProviderSettings {
 	const globalSettings = readSettingsFile(GLOBAL_SETTINGS_PATH);
@@ -251,6 +218,8 @@ function readSettingsFile(filePath: string): ProviderSettings {
 		const raw = readFileSync(filePath, "utf-8");
 		const parsed = JSON.parse(raw) as Record<string, unknown>;
 		const settingsBlock =
+			(parsed["claudeCodeAcp"] as Record<string, unknown> | undefined) ??
+			(parsed["claude-code-acp"] as Record<string, unknown> | undefined) ??
 			(parsed["claudeAgentSdkProvider"] as Record<string, unknown> | undefined) ??
 			(parsed["claude-agent-sdk-provider"] as Record<string, unknown> | undefined) ??
 			(parsed["claudeAgentSdk"] as Record<string, unknown> | undefined);
@@ -273,15 +242,24 @@ function readSettingsFile(filePath: string): ProviderSettings {
 		const strictMcpConfig =
 			typeof settingsBlock["strictMcpConfig"] === "boolean" ? settingsBlock["strictMcpConfig"] : undefined;
 
-		const legacyDisable = false;
-		return {
-			appendSystemPrompt: appendSystemPrompt ?? (legacyDisable ? false : undefined),
-			settingSources,
-			strictMcpConfig,
-		};
+		return { appendSystemPrompt, settingSources, strictMcpConfig };
 	} catch {
 		return {};
 	}
+}
+
+// --- Skills & AGENTS.md ---
+
+function extractSkillsAppend(systemPrompt?: string): string | undefined {
+	if (!systemPrompt) return undefined;
+	const startMarker = "The following skills provide specialized instructions for specific tasks.";
+	const endMarker = "</available_skills>";
+	const startIndex = systemPrompt.indexOf(startMarker);
+	if (startIndex === -1) return undefined;
+	const endIndex = systemPrompt.indexOf(endMarker, startIndex);
+	if (endIndex === -1) return undefined;
+	const skillsBlock = systemPrompt.slice(startIndex, endIndex + endMarker.length).trim();
+	return rewriteSkillsLocations(skillsBlock);
 }
 
 function rewriteSkillsLocations(skillsBlock: string): string {
@@ -357,140 +335,7 @@ function rewriteSkillAliasPath(pathValue: unknown): unknown {
 	return pathValue;
 }
 
-function mapToolName(name: string, customToolNameToPi?: Map<string, string>): string {
-	const normalized = name.toLowerCase();
-	const builtin = SDK_TO_PI_TOOL_NAME[normalized];
-	if (builtin) return builtin;
-	if (customToolNameToPi) {
-		const mapped = customToolNameToPi.get(name) ?? customToolNameToPi.get(normalized);
-		if (mapped) return mapped;
-	}
-	if (normalized.startsWith(MCP_TOOL_PREFIX)) {
-		return name.slice(MCP_TOOL_PREFIX.length);
-	}
-	return name;
-}
-
-function mapToolArgs(
-	toolName: string,
-	args: Record<string, unknown> | undefined,
-	allowSkillAliasRewrite = true,
-): Record<string, unknown> {
-	const normalized = toolName.toLowerCase();
-	const input = args ?? {};
-	const resolvePath = (value: unknown) => (allowSkillAliasRewrite ? rewriteSkillAliasPath(value) : value);
-
-	switch (normalized) {
-		case "read":
-			return {
-				path: resolvePath(input.file_path ?? input.path),
-				offset: input.offset,
-				limit: input.limit,
-			};
-		case "write":
-			return {
-				path: resolvePath(input.file_path ?? input.path),
-				content: input.content,
-			};
-		case "edit":
-			return {
-				path: resolvePath(input.file_path ?? input.path),
-				oldText: input.old_string ?? input.oldText ?? input.old_text,
-				newText: input.new_string ?? input.newText ?? input.new_text,
-			};
-		case "bash":
-			return {
-				command: input.command,
-				timeout: input.timeout,
-			};
-		case "grep":
-			return {
-				pattern: input.pattern,
-				path: resolvePath(input.path),
-				glob: input.glob,
-				limit: input.head_limit ?? input.limit,
-			};
-		case "find":
-			return {
-				pattern: input.pattern,
-				path: resolvePath(input.path),
-			};
-		default:
-			return input;
-	}
-}
-
-function resolveSdkTools(context: Context): {
-	sdkTools: string[];
-	customTools: Tool[];
-	customToolNameToSdk: Map<string, string>;
-	customToolNameToPi: Map<string, string>;
-} {
-	if (!context.tools) {
-		return {
-			sdkTools: [...DEFAULT_TOOLS],
-			customTools: [],
-			customToolNameToSdk: new Map(),
-			customToolNameToPi: new Map(),
-		};
-	}
-
-	const sdkTools = new Set<string>();
-	const customTools: Tool[] = [];
-	const customToolNameToSdk = new Map<string, string>();
-	const customToolNameToPi = new Map<string, string>();
-
-	for (const tool of context.tools) {
-		const normalized = tool.name.toLowerCase();
-		if (BUILTIN_TOOL_NAMES.has(normalized)) {
-			const sdkName = PI_TO_SDK_TOOL_NAME[normalized];
-			if (sdkName) sdkTools.add(sdkName);
-			continue;
-		}
-		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
-		customTools.push(tool);
-		customToolNameToSdk.set(tool.name, sdkName);
-		customToolNameToSdk.set(normalized, sdkName);
-		customToolNameToPi.set(sdkName, tool.name);
-		customToolNameToPi.set(sdkName.toLowerCase(), tool.name);
-	}
-
-	return { sdkTools: Array.from(sdkTools), customTools, customToolNameToSdk, customToolNameToPi };
-}
-
-function buildCustomToolServers(customTools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
-	if (!customTools.length) return undefined;
-
-	const mcpTools = customTools.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		inputSchema: tool.parameters as unknown,
-		handler: async () => ({
-			content: [{ type: "text", text: TOOL_EXECUTION_DENIED_MESSAGE }],
-			isError: true,
-		}),
-	}));
-
-	const server = createSdkMcpServer({
-		name: MCP_SERVER_NAME,
-		version: "1.0.0",
-		tools: mcpTools,
-	});
-
-	return { [MCP_SERVER_NAME]: server };
-}
-
-function mapStopReason(reason: string | undefined): "stop" | "length" | "toolUse" {
-	switch (reason) {
-		case "tool_use":
-			return "toolUse";
-		case "max_tokens":
-			return "length";
-		case "end_turn":
-		default:
-			return "stop";
-	}
-}
+// --- Thinking budgets (kept for future use) ---
 
 type ThinkingLevel = NonNullable<SimpleStreamOptions["reasoning"]>;
 type NonXhighThinkingLevel = Exclude<ThinkingLevel, "xhigh">;
@@ -502,17 +347,11 @@ const DEFAULT_THINKING_BUDGETS: Record<NonXhighThinkingLevel, number> = {
 	high: 31999,
 };
 
-// NOTE: "xhigh" is unavailable in the TUI because pi-ai's supportsXhigh()
-// doesn't recognize the "claude-agent-sdk" api type. As a workaround, opus-4-6
-// gets shifted budgets so "high" uses the budget that xhigh would normally use.
 const OPUS_46_THINKING_BUDGETS: Record<ThinkingLevel, number> = {
 	minimal: 2048,
 	low: 8192,
 	medium: 31999,
 	high: 63999,
-	// Future-proofing: pi currently won't surface "xhigh" for this provider because
-	// pi-ai's supportsXhigh() doesn't recognize the "claude-agent-sdk" api type.
-	// If/when that changes, we can shift the budgets to 2048, 8192, 16384, 31999, 63999.
 	xhigh: 63999,
 };
 
@@ -539,16 +378,221 @@ function mapThinkingTokens(
 	return DEFAULT_THINKING_BUDGETS[effectiveReasoning];
 }
 
-function parsePartialJson(input: string, fallback: Record<string, unknown>): Record<string, unknown> {
-	if (!input) return fallback;
-	try {
-		return JSON.parse(input);
-	} catch {
-		return fallback;
+// --- ACP connection management ---
+
+interface TerminalState {
+	proc: ChildProcess;
+	output: string;
+	exitCode?: number | null;
+	signal?: string | null;
+}
+
+let acpProcess: ChildProcess | null = null;
+let acpConnection: ClientSideConnection | null = null;
+let sessionUpdateHandler: ((update: SessionUpdate) => void) | null = null;
+let activeSessionId: string | null = null;
+let activeModelId: string | null = null;
+let lastContextLength = 0;
+let nextTerminalId = 1;
+const terminals = new Map<string, TerminalState>();
+
+function handleRequestPermission(params: RequestPermissionRequest): RequestPermissionResponse {
+	const allowOption = params.options.find(
+		(o) => o.kind === "allow_once" || o.kind === "allow_always",
+	);
+	if (allowOption) {
+		return { outcome: { outcome: "selected", optionId: allowOption.optionId } };
+	}
+	return { outcome: { outcome: "cancelled" } };
+}
+
+async function handleReadTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+	const content = await readFile(params.path, "utf-8");
+	if (params.line != null || params.limit != null) {
+		const lines = content.split("\n");
+		const start = Math.max(0, (params.line ?? 1) - 1);
+		const end = params.limit != null ? start + params.limit : lines.length;
+		return { content: lines.slice(start, end).join("\n") };
+	}
+	return { content };
+}
+
+async function handleWriteTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
+	await mkdir(dirname(params.path), { recursive: true });
+	await writeFile(params.path, params.content, "utf-8");
+	return {};
+}
+
+function handleCreateTerminal(params: CreateTerminalRequest): CreateTerminalResponse {
+	const id = `term-${nextTerminalId++}`;
+	const args = params.args ?? [];
+	const proc = spawn(params.command, args, {
+		cwd: params.cwd ?? process.cwd(),
+		stdio: ["ignore", "pipe", "pipe"],
+		env: {
+			...process.env,
+			...(params.env
+				? Object.fromEntries(params.env.map((e) => [e.name, e.value]))
+				: {}),
+		},
+	});
+
+	const state: TerminalState = { proc, output: "" };
+	terminals.set(id, state);
+
+	proc.stdout?.on("data", (chunk: Buffer) => {
+		state.output += chunk.toString();
+		if (params.outputByteLimit && state.output.length > params.outputByteLimit) {
+			state.output = state.output.slice(-params.outputByteLimit);
+		}
+	});
+	proc.stderr?.on("data", (chunk: Buffer) => {
+		state.output += chunk.toString();
+		if (params.outputByteLimit && state.output.length > params.outputByteLimit) {
+			state.output = state.output.slice(-params.outputByteLimit);
+		}
+	});
+	proc.on("close", (code, signal) => {
+		state.exitCode = code;
+		state.signal = signal;
+	});
+
+	return { terminalId: id };
+}
+
+function handleTerminalOutput(params: TerminalOutputRequest): TerminalOutputResponse {
+	const state = terminals.get(params.terminalId);
+	if (!state) return { output: "", truncated: false };
+	return {
+		output: state.output,
+		truncated: false,
+		...(state.exitCode !== undefined || state.signal !== undefined
+			? { exitStatus: { exitCode: state.exitCode, signal: state.signal } }
+			: {}),
+	};
+}
+
+async function handleWaitForTerminalExit(
+	params: WaitForTerminalExitRequest,
+): Promise<WaitForTerminalExitResponse> {
+	const state = terminals.get(params.terminalId);
+	if (!state) return { exitCode: 1 };
+	return new Promise((resolve) => {
+		state.proc.on("close", (code, signal) => {
+			resolve({ exitCode: code, signal });
+		});
+		if (state.exitCode !== undefined || state.signal !== undefined) {
+			resolve({ exitCode: state.exitCode, signal: state.signal });
+		}
+	});
+}
+
+function handleKillTerminal(params: KillTerminalRequest): KillTerminalResponse | void {
+	const state = terminals.get(params.terminalId);
+	if (state) state.proc.kill();
+}
+
+function handleReleaseTerminal(params: ReleaseTerminalRequest): ReleaseTerminalResponse | void {
+	const state = terminals.get(params.terminalId);
+	if (state) {
+		state.proc.kill();
+		terminals.delete(params.terminalId);
 	}
 }
 
-function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function killConnection() {
+	if (acpProcess) {
+		acpProcess.kill();
+		acpProcess = null;
+	}
+	for (const [, state] of terminals) {
+		state.proc.kill();
+	}
+	terminals.clear();
+	acpConnection = null;
+	sessionUpdateHandler = null;
+	activeSessionId = null;
+	activeModelId = null;
+	lastContextLength = 0;
+	nextTerminalId = 1;
+}
+
+async function ensureConnection(): Promise<ClientSideConnection> {
+	if (acpConnection) return acpConnection;
+
+	const child = spawn("npx", ["-y", "@zed-industries/claude-agent-acp"], {
+		cwd: process.cwd(),
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+	acpProcess = child;
+
+	child.stderr?.on("data", () => {
+		// Suppress stderr noise from npx/agent startup
+	});
+
+	child.on("close", () => {
+		acpProcess = null;
+		killConnection();
+	});
+
+	const input = Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>;
+	const output = Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>;
+	const rawStream = ndJsonStream(input, output);
+
+	// Intercept session/update notifications before SDK validation
+	// (same workaround as claude-acp.ts — avoids Zod union parse errors)
+	const filter = new TransformStream({
+		transform(msg: any, controller) {
+			if ("method" in msg && msg.method === "session/update" && !("id" in msg) && msg.params) {
+				try {
+					const update = (msg.params as SessionNotification).update;
+					sessionUpdateHandler?.(update);
+				} catch (e) {
+					console.error("[claude-code-acp] session/update handler error:", e);
+				}
+				return;
+			}
+			controller.enqueue(msg);
+		},
+	});
+	rawStream.readable.pipeTo(filter.writable).catch(() => {});
+	const stream = { readable: filter.readable, writable: rawStream.writable };
+
+	const connection = new ClientSideConnection(
+		() => ({
+			sessionUpdate: async () => {}, // handled by stream filter above
+			requestPermission: async (params) => handleRequestPermission(params),
+			readTextFile: async (params) => handleReadTextFile(params),
+			writeTextFile: async (params) => handleWriteTextFile(params),
+			createTerminal: async (params) => handleCreateTerminal(params),
+			terminalOutput: async (params) => handleTerminalOutput(params),
+			waitForTerminalExit: async (params) => handleWaitForTerminalExit(params),
+			killTerminal: async (params) => handleKillTerminal(params),
+			releaseTerminal: async (params) => handleReleaseTerminal(params),
+		}),
+		stream,
+	);
+
+	await connection.initialize({
+		protocolVersion: PROTOCOL_VERSION,
+		clientCapabilities: {
+			fs: { readTextFile: true, writeTextFile: true },
+			terminal: true,
+		},
+		clientInfo: { name: "pi-claude-code-acp", version: "0.1.0" },
+	});
+
+	acpConnection = connection;
+	return connection;
+}
+
+// Clean up on process exit
+process.on("exit", () => killConnection());
+process.on("SIGTERM", () => killConnection());
+
+// --- Core streaming function ---
+
+function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
 	(async () => {
@@ -570,306 +614,248 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			timestamp: Date.now(),
 		};
 
-		let sdkQuery: ReturnType<typeof query> | undefined;
-		let wasAborted = false;
-		const requestAbort = () => {
-			if (!sdkQuery) return;
-			void sdkQuery.interrupt().catch(() => {
-				try {
-					sdkQuery?.close();
-				} catch {
-					// ignore shutdown errors
-				}
-			});
-		};
-		const onAbort = () => {
-			wasAborted = true;
-			requestAbort();
-		};
-		if (options?.signal) {
-			if (options.signal.aborted) onAbort();
-			else options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-
 		const blocks = output.content as Array<
-			| { type: "text"; text: string; index: number }
-			| { type: "thinking"; thinking: string; thinkingSignature?: string; index: number }
-			| {
-				type: "toolCall";
-				id: string;
-				name: string;
-				arguments: Record<string, unknown>;
-				partialJson: string;
-				index: number;
-			}
+			| { type: "text"; text: string }
+			| { type: "thinking"; thinking: string }
+			| { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> }
 		>;
 
 		let started = false;
-		let sawStreamEvent = false;
-		let sawToolCall = false;
-		let shouldStopEarly = false;
+		let textBlockIndex = -1;
+		let thinkingBlockIndex = -1;
+		let sessionId: string | null = null;
+
+		const pushStart = () => {
+			if (!started) {
+				stream.push({ type: "start", partial: output });
+				started = true;
+			}
+		};
+
+		// Track tool call IDs to content block indices
+		const toolCallIndexMap = new Map<string, number>();
 
 		try {
-			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
-			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk);
-			const prompt = buildPromptStream(promptBlocks);
+			const connection = await ensureConnection();
 
-			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-
-			const mcpServers = buildCustomToolServers(customTools);
+			// Build system prompt append
 			const providerSettings = loadProviderSettings();
 			const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 			const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 			const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
 			const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
 			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-			const allowSkillAliasRewrite = Boolean(skillsAppend);
 
-			const settingSources: SettingSource[] | undefined = appendSystemPrompt
-				? undefined
-				: providerSettings.settingSources ?? ["user", "project"];
+			// Determine if we need a new session or can reuse
+			let promptText: string;
+			if (!activeSessionId) {
+				// First call or session was lost — new session with full context
+				const session = await connection.newSession({ cwd: process.cwd(), mcpServers: [] });
+				sessionId = session.sessionId;
+				activeSessionId = sessionId;
+				await connection.setSessionMode({ sessionId, modeId: "bypassPermissions" });
+				await connection.unstable_setSessionModel({ sessionId, modelId: model.id });
+				activeModelId = model.id;
+				promptText = buildPromptText(context, systemPromptAppend);
+				lastContextLength = context.messages.length;
+			} else {
+				// Continuation — send only new messages
+				sessionId = activeSessionId;
+				// Update model if changed
+				if (activeModelId !== model.id) {
+					await connection.unstable_setSessionModel({ sessionId, modelId: model.id });
+					activeModelId = model.id;
+				}
+				const newMessages = context.messages.slice(lastContextLength);
+				if (newMessages.length > 0) {
+					promptText = buildPromptText({ ...context, messages: newMessages });
+				} else {
+					// Fallback: send the last user message
+					const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+					promptText = lastUser
+						? messageContentToText(lastUser.content) || ""
+						: "";
+				}
+				lastContextLength = context.messages.length;
+			}
 
-			// Claude Code will auto-load MCP servers from ~/.claude.json and .mcp.json when settingSources is enabled.
-			// In this provider, Claude Code tool execution is denied and pi executes tools instead, so auto-loaded MCP
-			// tools are pure token overhead. Pass --strict-mcp-config to ignore all MCP configs except those explicitly
-			// provided via the SDK (mcpServers option).
-			const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
-			const extraArgs = strictMcpConfigEnabled ? { "strict-mcp-config": null } : undefined;
+			// Wire session update handler for this call
+			sessionUpdateHandler = (update: SessionUpdate) => {
+				pushStart();
 
-			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
-				cwd,
-				model: model.id,
-				tools: sdkTools,
-				permissionMode: "dontAsk",
-				includePartialMessages: true,
-				canUseTool: async () => ({
-					behavior: "deny",
-					message: TOOL_EXECUTION_DENIED_MESSAGE,
-				}),
-				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
-				...(settingSources ? { settingSources } : {}),
-				...(extraArgs ? { extraArgs } : {}),
-				...(mcpServers ? { mcpServers } : {}),
+				switch (update.sessionUpdate) {
+					case "agent_message_chunk": {
+						const content = update.content;
+						if (content.type === "text" && "text" in content) {
+							const text = (content as { text: string }).text;
+							if (textBlockIndex === -1) {
+								blocks.push({ type: "text", text: "" });
+								textBlockIndex = blocks.length - 1;
+								stream.push({ type: "text_start", contentIndex: textBlockIndex, partial: output });
+							}
+							const block = blocks[textBlockIndex] as { type: "text"; text: string };
+							block.text += text;
+							stream.push({
+								type: "text_delta",
+								contentIndex: textBlockIndex,
+								delta: text,
+								partial: output,
+							});
+						}
+						break;
+					}
+
+					case "agent_thought_chunk": {
+						const content = update.content;
+						if (content.type === "text" && "text" in content) {
+							const text = (content as { text: string }).text;
+							if (thinkingBlockIndex === -1) {
+								blocks.push({ type: "thinking", thinking: "" });
+								thinkingBlockIndex = blocks.length - 1;
+								stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
+							}
+							const block = blocks[thinkingBlockIndex] as { type: "thinking"; thinking: string };
+							block.thinking += text;
+							stream.push({
+								type: "thinking_delta",
+								contentIndex: thinkingBlockIndex,
+								delta: text,
+								partial: output,
+							});
+						}
+						break;
+					}
+
+					case "tool_call": {
+						const tc = update as ToolCall & { sessionUpdate: string };
+						// Close any open text block before tool call
+						if (textBlockIndex !== -1) {
+							const textBlock = blocks[textBlockIndex] as { type: "text"; text: string };
+							stream.push({ type: "text_end", contentIndex: textBlockIndex, content: textBlock.text, partial: output });
+							textBlockIndex = -1;
+						}
+						// Extract tool name from title (e.g., "Read src/foo.ts" → "Read")
+						const titleParts = tc.title.split(" ");
+						const rawToolName = titleParts[0] || tc.title;
+						const piToolName = mapToolName(rawToolName);
+						const args = tc.rawInput
+							? mapToolArgs(piToolName, tc.rawInput as Record<string, unknown>)
+							: {};
+
+						const block = {
+							type: "toolCall" as const,
+							id: tc.toolCallId,
+							name: piToolName,
+							arguments: args,
+						};
+						blocks.push(block);
+						const idx = blocks.length - 1;
+						toolCallIndexMap.set(tc.toolCallId, idx);
+						stream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
+						break;
+					}
+
+					case "tool_call_update": {
+						const tc = update as ToolCallUpdate & { sessionUpdate: string };
+						const idx = toolCallIndexMap.get(tc.toolCallId);
+						if (idx != null && (tc.status === "completed" || tc.status === "failed")) {
+							const block = blocks[idx] as { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
+							if (tc.rawInput) {
+								block.arguments = mapToolArgs(block.name, tc.rawInput as Record<string, unknown>);
+							}
+							stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: block, partial: output });
+						}
+						break;
+					}
+
+					case "usage_update": {
+						const usage = update as { used?: number; size?: number; cost?: { total?: number } } & { sessionUpdate: string };
+						if (usage.used != null) output.usage.totalTokens = usage.used;
+						// ACP doesn't break down input/output/cache — put total in input
+						if (usage.used != null) output.usage.input = usage.used;
+						calculateCost(model, output.usage);
+						break;
+					}
+
+					default:
+						break;
+				}
 			};
 
-			const maxThinkingTokens = mapThinkingTokens(options?.reasoning, model.id, options?.thinkingBudgets);
-			if (maxThinkingTokens != null) {
-				queryOptions.maxThinkingTokens = maxThinkingTokens;
+			// Set up abort handling
+			const onAbort = () => {
+				if (sessionId && acpConnection) {
+					acpConnection.cancel({ sessionId });
+				}
+			};
+			if (options?.signal) {
+				if (options.signal.aborted) onAbort();
+				else options.signal.addEventListener("abort", onAbort, { once: true });
 			}
 
-			sdkQuery = query({
-				prompt,
-				options: queryOptions,
-			});
+			try {
+				const result = await connection.prompt({
+					sessionId,
+					prompt: [{ type: "text", text: promptText }],
+				});
 
-			if (wasAborted) {
-				requestAbort();
-			}
-
-			for await (const message of sdkQuery) {
-				if (!started) {
-					stream.push({ type: "start", partial: output });
-					started = true;
+				// Close any open blocks
+				if (thinkingBlockIndex !== -1) {
+					const thinkBlock = blocks[thinkingBlockIndex] as { type: "thinking"; thinking: string };
+					stream.push({ type: "thinking_end", contentIndex: thinkingBlockIndex, content: thinkBlock.thinking, partial: output });
+				}
+				if (textBlockIndex !== -1) {
+					const textBlock = blocks[textBlockIndex] as { type: "text"; text: string };
+					stream.push({ type: "text_end", contentIndex: textBlockIndex, content: textBlock.text, partial: output });
 				}
 
-				switch (message.type) {
-					case "stream_event": {
-						sawStreamEvent = true;
-						const event = (message as SDKMessage & { event: any }).event;
-
-						if (event?.type === "message_start") {
-							const usage = event.message?.usage;
-							output.usage.input = usage?.input_tokens ?? 0;
-							output.usage.output = usage?.output_tokens ?? 0;
-							output.usage.cacheRead = usage?.cache_read_input_tokens ?? 0;
-							output.usage.cacheWrite = usage?.cache_creation_input_tokens ?? 0;
-							output.usage.totalTokens =
-								output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-							calculateCost(model, output.usage);
-							break;
-						}
-
-						if (event?.type === "content_block_start") {
-							if (event.content_block?.type === "text") {
-								const block = { type: "text", text: "", index: event.index } as const;
-								output.content.push(block);
-								stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
-							} else if (event.content_block?.type === "thinking") {
-								const block = { type: "thinking", thinking: "", thinkingSignature: "", index: event.index } as const;
-								output.content.push(block);
-								stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
-							} else if (event.content_block?.type === "tool_use") {
-								sawToolCall = true;
-								const block = {
-									type: "toolCall",
-									id: event.content_block.id,
-									name: mapToolName(event.content_block.name, customToolNameToPi),
-									arguments: (event.content_block.input as Record<string, unknown>) ?? {},
-									partialJson: "",
-									index: event.index,
-								} as const;
-								output.content.push(block);
-								stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
-							}
-							break;
-						}
-
-						if (event?.type === "content_block_delta") {
-							if (event.delta?.type === "text_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
-								const block = blocks[index];
-								if (block?.type === "text") {
-									block.text += event.delta.text;
-									stream.push({
-										type: "text_delta",
-										contentIndex: index,
-										delta: event.delta.text,
-										partial: output,
-									});
-								}
-							} else if (event.delta?.type === "thinking_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
-								const block = blocks[index];
-								if (block?.type === "thinking") {
-									block.thinking += event.delta.thinking;
-									stream.push({
-										type: "thinking_delta",
-										contentIndex: index,
-										delta: event.delta.thinking,
-										partial: output,
-									});
-								}
-							} else if (event.delta?.type === "input_json_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
-								const block = blocks[index];
-								if (block?.type === "toolCall") {
-									block.partialJson += event.delta.partial_json;
-									block.arguments = parsePartialJson(block.partialJson, block.arguments);
-									stream.push({
-										type: "toolcall_delta",
-										contentIndex: index,
-										delta: event.delta.partial_json,
-										partial: output,
-									});
-								}
-							} else if (event.delta?.type === "signature_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
-								const block = blocks[index];
-								if (block?.type === "thinking") {
-									block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
-								}
-							}
-							break;
-						}
-
-						if (event?.type === "content_block_stop") {
-							const index = blocks.findIndex((block) => block.index === event.index);
-							const block = blocks[index];
-							if (!block) break;
-							delete (block as any).index;
-							if (block.type === "text") {
-								stream.push({
-									type: "text_end",
-									contentIndex: index,
-									content: block.text,
-									partial: output,
-								});
-							} else if (block.type === "thinking") {
-								stream.push({
-									type: "thinking_end",
-									contentIndex: index,
-									content: block.thinking,
-									partial: output,
-								});
-							} else if (block.type === "toolCall") {
-								sawToolCall = true;
-								block.arguments = mapToolArgs(
-									block.name,
-									parsePartialJson(block.partialJson, block.arguments),
-									allowSkillAliasRewrite,
-								);
-								delete (block as any).partialJson;
-								stream.push({
-									type: "toolcall_end",
-									contentIndex: index,
-									toolCall: block,
-									partial: output,
-								});
-							}
-							break;
-						}
-
-						if (event?.type === "message_delta") {
-							output.stopReason = mapStopReason(event.delta?.stop_reason);
-							const usage = event.usage ?? {};
-							if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
-							if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
-							if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
-							if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
-							output.usage.totalTokens =
-								output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-							calculateCost(model, output.usage);
-							break;
-						}
-
-						if (event?.type === "message_stop" && sawToolCall) {
-							output.stopReason = "toolUse";
-							shouldStopEarly = true;
-							break;
-						}
-
-						break;
-					}
-
-					case "result": {
-						if (!sawStreamEvent && message.subtype === "success") {
-							output.content.push({ type: "text", text: message.result || "" });
-						}
-						break;
-					}
+				if (options?.signal?.aborted) {
+					output.stopReason = "aborted";
+					output.errorMessage = "Operation aborted";
+					stream.push({ type: "error", reason: "aborted", error: output });
+					stream.end();
+					return;
 				}
 
-				if (shouldStopEarly) {
-					break;
-				}
-			}
-
-			if (wasAborted || options?.signal?.aborted) {
-				output.stopReason = "aborted";
-				output.errorMessage = "Operation aborted";
-				stream.push({ type: "error", reason: "aborted", error: output });
+				output.stopReason = result.stopReason === "cancelled" ? "aborted" : "stop";
+				pushStart();
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: output,
+				});
 				stream.end();
-				return;
+			} finally {
+				if (options?.signal) {
+					options.signal.removeEventListener("abort", onAbort);
+				}
+				sessionUpdateHandler = null;
+			}
+		} catch (error) {
+			// If connection failed, reset for retry on next call
+			if (!acpConnection || acpProcess === null) {
+				killConnection();
 			}
 
-			stream.push({
-				type: "done",
-				reason: output.stopReason === "toolUse" ? "toolUse" : output.stopReason === "length" ? "length" : "stop",
-				message: output,
-			});
-			stream.end();
-		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : String(error);
+			if (!started) stream.push({ type: "start", partial: output });
 			stream.push({ type: "error", reason: output.stopReason as "aborted" | "error", error: output });
 			stream.end();
-		} finally {
-			if (options?.signal) {
-				options.signal.removeEventListener("abort", onAbort);
-			}
-			sdkQuery?.close();
 		}
 	})();
 
 	return stream;
 }
 
+// --- Provider registration ---
+
 export default function (pi: ExtensionAPI) {
 	pi.registerProvider(PROVIDER_ID, {
-		baseUrl: "claude-agent-sdk",
-		apiKey: "ANTHROPIC_API_KEY",
-		api: "claude-agent-sdk",
+		baseUrl: "claude-code-acp",
+		apiKey: "not-used",
+		api: "claude-code-acp",
 		models: MODELS,
-		streamSimple: streamClaudeAgentSdk,
+		streamSimple: streamClaudeAcp,
 	});
 }
