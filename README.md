@@ -66,6 +66,8 @@ Config files: `~/.pi/agent/claude-code-acp.json` (global) and `.pi/claude-code-a
 
 **MCP suppression is untested.** `--strict-mcp-config` is passed via `extraArgs` in `_meta` — this may not work through the ACP bridge. If MCP tools leak through, the fallback is explicit `allowedTools` in all modes.
 
+**Claude Code loads its own skills** from `~/.claude/skills/` and `.claude/skills/` in addition to the pi skills we forward. These are additive — Claude Code may have skills pi doesn't know about.
+
 See [docs/acp-meta-reference.md](docs/acp-meta-reference.md) for the full set of available ACP `_meta` options.
 
 ## TODOs
