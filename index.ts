@@ -1,10 +1,13 @@
-import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
+import { calculateCost, createAssistantMessageEventStream, getModels, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION, type SessionNotification, type SessionUpdate, type PromptResponse } from "@agentclientprotocol/sdk";
+import { Type } from "@sinclair/typebox";
+import { Text } from "@mariozechner/pi-tui";
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { writeFile, unlink } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable, Readable } from "node:stream";
 
@@ -24,6 +27,96 @@ const MODELS = getModels("anthropic")
 		contextWindow: model.contextWindow,
 		maxTokens: model.maxTokens,
 	}));
+
+// --- Config ---
+
+interface Config {
+	askClaude?: {
+		enabled?: boolean;
+		name?: string;
+		label?: string;
+		description?: string;
+		defaultMode?: "full" | "read" | "none";
+	};
+}
+
+function loadConfig(cwd: string): Config {
+	const globalPath = join(homedir(), ".pi", "agent", "claude-code-acp.json");
+	const projectPath = join(cwd, ".pi", "claude-code-acp.json");
+
+	let global: Partial<Config> = {};
+	let project: Partial<Config> = {};
+
+	if (existsSync(globalPath)) {
+		try { global = JSON.parse(readFileSync(globalPath, "utf-8")); } catch {}
+	}
+	if (existsSync(projectPath)) {
+		try { project = JSON.parse(readFileSync(projectPath, "utf-8")); } catch {}
+	}
+
+	return {
+		askClaude: { ...global.askClaude, ...project.askClaude },
+	};
+}
+
+// --- AskClaude helpers ---
+
+interface ToolCallState {
+	name: string;
+	status: string;
+	rawInput?: unknown;
+	locations?: Array<{ path?: string; uri?: string }>;
+}
+
+function extractPath(rawInput: unknown): string | undefined {
+	if (!rawInput || typeof rawInput !== "object") return undefined;
+	const input = rawInput as Record<string, unknown>;
+	if (typeof input.file_path === "string") return input.file_path;
+	if (typeof input.path === "string") return input.path;
+	if (typeof input.command === "string") return input.command.substring(0, 80);
+	return undefined;
+}
+
+function tcPath(tc: ToolCallState): string | undefined {
+	const loc = tc.locations?.[0]?.path;
+	return loc ?? extractPath(tc.rawInput);
+}
+
+function buildActionSummary(calls: Map<string, ToolCallState>): string {
+	const reads: string[] = [];
+	const edits: string[] = [];
+	const commands: string[] = [];
+	const other: string[] = [];
+
+	for (const [, tc] of calls) {
+		const path = tcPath(tc);
+		const name = tc.name.toLowerCase();
+		if (name === "read" || name === "readfile") {
+			if (path) reads.push(path);
+		} else if (name === "edit" || name === "write" || name === "writefile" || name === "multiedit") {
+			if (path) edits.push(path);
+		} else if (name === "bash" || name === "terminal") {
+			commands.push(path ?? "command");
+		} else {
+			other.push(tc.name + (path ? ` ${path}` : ""));
+		}
+	}
+
+	const parts: string[] = [];
+	if (reads.length) parts.push(`read ${reads.join(", ")}`);
+	if (edits.length) parts.push(`edited ${edits.join(", ")}`);
+	if (commands.length) parts.push(`ran ${commands.join("; ")}`);
+	if (other.length) parts.push(other.join("; "));
+	return parts.join("; ");
+}
+
+const MODE_PRESETS: Record<string, Record<string, unknown>> = {
+	full: {},
+	read: { claudeCode: { options: { allowedTools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"] } } },
+	none: { disableBuiltInTools: true },
+};
+
+// --- Provider helpers ---
 
 function getToolsForMcp(tools?: Tool[]): Tool[] {
 	return tools ?? [];
@@ -372,6 +465,81 @@ async function ensureConnection(): Promise<ClientSideConnection> {
 process.on("exit", () => killConnection());
 process.on("SIGTERM", () => killConnection());
 
+// --- AskClaude: prompt and wait ---
+
+async function promptAndWait(
+	prompt: string,
+	mode: "full" | "read" | "none",
+	toolCalls: Map<string, ToolCallState>,
+	signal?: AbortSignal,
+	onStreamUpdate?: (responseText: string) => void,
+): Promise<{ responseText: string; stopReason: string }> {
+	const connection = await ensureConnection();
+
+	const meta = MODE_PRESETS[mode] ?? {};
+	const session = await connection.newSession({
+		cwd: process.cwd(),
+		mcpServers: [],
+		...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
+	} as any);
+	const sid = session.sessionId;
+	await connection.setSessionMode({ sessionId: sid, modeId: "bypassPermissions" });
+
+	let responseText = "";
+
+	sessionUpdateHandler = (update: SessionUpdate) => {
+		switch (update.sessionUpdate) {
+			case "agent_message_chunk": {
+				const content = update.content;
+				if (content.type === "text" && "text" in content) {
+					responseText += (content as { text: string }).text;
+					onStreamUpdate?.(responseText);
+				}
+				break;
+			}
+			case "tool_call": {
+				const tc = update as any;
+				toolCalls.set(tc.toolCallId, {
+					name: tc.title ?? "tool",
+					status: tc.status ?? "pending",
+					rawInput: tc.rawInput,
+					locations: tc.locations,
+				});
+				break;
+			}
+			case "tool_call_update": {
+				const tc = update as any;
+				const existing = toolCalls.get(tc.toolCallId);
+				if (existing) {
+					if (tc.title) existing.name = tc.title;
+					if (tc.status) existing.status = tc.status;
+					if (tc.rawInput !== undefined) existing.rawInput = tc.rawInput;
+					if (tc.locations) existing.locations = tc.locations;
+				}
+				break;
+			}
+		}
+	};
+
+	const onAbort = () => connection.cancel({ sessionId: sid });
+	if (signal) {
+		if (signal.aborted) onAbort();
+		else signal.addEventListener("abort", onAbort, { once: true });
+	}
+
+	try {
+		const result = await connection.prompt({
+			sessionId: sid,
+			prompt: [{ type: "text", text: prompt }],
+		});
+		return { responseText, stopReason: result.stopReason };
+	} finally {
+		signal?.removeEventListener("abort", onAbort);
+		sessionUpdateHandler = null;
+		connection.unstable_closeSession({ sessionId: sid }).catch(() => {});
+	}
+}
+
 // --- Core streaming function ---
 
 type RaceResult =
@@ -640,9 +808,16 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 	return stream;
 }
 
-// --- Provider registration ---
+// --- Provider + tool registration ---
+
+const DEFAULT_TOOL_DESCRIPTION = "Delegate to Claude Code. Use for: analysis and second opinions (code review, architecture questions, debugging theories), or autonomous tasks (implement a feature, fix a bug, refactor code). Claude Code's tools are auto-approved — it can read, write, and run commands without user confirmation. Prefer to handle straightforward tasks yourself.";
+
+const PREVIEW_MAX_CHARS = 1000;
+const PREVIEW_MAX_LINES = 6;
 
 export default function (pi: ExtensionAPI) {
+	const config = loadConfig(process.cwd());
+
 	pi.on("session_shutdown", async () => {
 		killConnection();
 	});
@@ -654,4 +829,108 @@ export default function (pi: ExtensionAPI) {
 		models: MODELS,
 		streamSimple: streamClaudeAcp,
 	});
+
+	// --- AskClaude tool ---
+
+	const askConf = config.askClaude;
+	const defaultMode = askConf?.defaultMode ?? "full";
+
+	if (askConf?.enabled !== false) {
+		pi.registerTool({
+			name: askConf?.name ?? "AskClaude",
+			label: askConf?.label ?? "Ask Claude Code",
+			description: askConf?.description ?? DEFAULT_TOOL_DESCRIPTION,
+			parameters: Type.Object({
+				prompt: Type.String({ description: "The question or task for Claude Code. Claude only sees this prompt (no conversation history) — include the user's original question and any relevant context. Don't research up front, let Claude explore." }),
+				mode: Type.Optional(StringEnum(["full", "read", "none"] as const, {
+					description: `"read": questions about the codebase (review, analysis, explain). "full": tasks that need changes or shell commands. "none": questions that don't involve repo files (general knowledge, brainstorming, opinions).`,
+				})),
+			}),
+			renderCall(args, theme) {
+				let text = theme.fg("mdLink", theme.bold("AskClaude "));
+				const mode = args.mode ?? defaultMode;
+				if (mode !== "full") text += `${theme.fg("muted", `[tools=${mode}]`)} `;
+				const truncated = args.prompt.length > PREVIEW_MAX_CHARS ? args.prompt.substring(0, PREVIEW_MAX_CHARS) : args.prompt;
+				const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
+				text += theme.fg("muted", `"${lines.join("\n")}"`);
+				if (args.prompt.length > PREVIEW_MAX_CHARS || args.prompt.split("\n").length > PREVIEW_MAX_LINES) text += theme.fg("dim", " …");
+				return new Text(text, 0, 0);
+			},
+			renderResult(result, { expanded, isPartial }, theme) {
+				if (isPartial) {
+					const status = result.content[0]?.type === "text" ? result.content[0].text : "working...";
+					return new Text(theme.fg("mdLink", "◉ Claude Code ") + theme.fg("muted", status), 0, 0);
+				}
+
+				const details = result.details as { prompt?: string; executionTime?: number; actions?: string; error?: boolean } | undefined;
+				const body = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+				let text = details?.error
+					? theme.fg("error", "✗ Claude Code error")
+					: theme.fg("mdLink", "✓ Claude Code");
+
+				if (details?.executionTime) text += ` ${theme.fg("dim", `${(details.executionTime / 1000).toFixed(1)}s`)}`;
+				if (details?.actions) text += ` ${theme.fg("muted", details.actions)}`;
+
+				if (expanded) {
+					if (details?.prompt) text += `\n${theme.fg("dim", `Prompt: ${details.prompt}`)}`;
+					if (details?.prompt && body) text += `\n${theme.fg("dim", "─".repeat(40))}`;
+					if (body) text += `\n${theme.fg("toolOutput", body)}`;
+				} else {
+					const truncated = body.length > PREVIEW_MAX_CHARS ? body.substring(0, PREVIEW_MAX_CHARS) : body;
+					const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
+					if (lines.length) text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
+					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", "…")}`;
+				}
+
+				return new Text(text, 0, 0);
+			},
+			async execute(_id, params, signal, onUpdate, ctx) {
+				// Guard: circular delegation
+				if (ctx.model?.baseUrl === "claude-code-acp") {
+					return {
+						content: [{ type: "text" as const, text: "Error: AskClaude cannot be used when the active provider is claude-code-acp — you're already running through Claude Code." }],
+						details: { error: true },
+					};
+				}
+
+				const mode = (params.mode ?? defaultMode) as "full" | "read" | "none";
+				const toolCalls = new Map<string, ToolCallState>();
+				const start = Date.now();
+
+				const progressInterval = setInterval(() => {
+					const elapsed = ((Date.now() - start) / 1000).toFixed(0);
+					const summary = buildActionSummary(toolCalls);
+					const status = summary ? `${elapsed}s — ${summary}` : `${elapsed}s — working...`;
+					onUpdate?.({
+						content: [{ type: "text", text: status }],
+						details: { prompt: params.prompt, executionTime: Date.now() - start },
+					});
+				}, 1000);
+
+				try {
+					const result = await promptAndWait(params.prompt, mode, toolCalls, signal);
+					clearInterval(progressInterval);
+					const executionTime = Date.now() - start;
+					const actions = buildActionSummary(toolCalls);
+
+					const text = actions
+						? `${result.responseText}\n\n[Claude Code actions: ${actions}]`
+						: result.responseText;
+					return {
+						content: [{ type: "text" as const, text }],
+						details: { prompt: params.prompt, executionTime, actions },
+					};
+				} catch (err) {
+					clearInterval(progressInterval);
+					const msg = err instanceof Error ? err.message : String(err);
+					return {
+						content: [{ type: "text" as const, text: `Error: ${msg}` }],
+						details: { prompt: params.prompt, executionTime: Date.now() - start, error: true },
+					};
+				}
+			},
+		});
+	}
+
 }
