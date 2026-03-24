@@ -1,51 +1,12 @@
-import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
+import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION, type SessionNotification, type SessionUpdate, type ToolCall, type ToolCallUpdate, type RequestPermissionRequest, type RequestPermissionResponse, type ReadTextFileRequest, type ReadTextFileResponse, type WriteTextFileRequest, type WriteTextFileResponse, type CreateTerminalRequest, type CreateTerminalResponse, type TerminalOutputRequest, type TerminalOutputResponse, type WaitForTerminalExitRequest, type WaitForTerminalExitResponse, type KillTerminalRequest, type KillTerminalResponse, type ReleaseTerminalRequest, type ReleaseTerminalResponse } from "@agentclientprotocol/sdk";
+import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION, type SessionNotification, type SessionUpdate, type RequestPermissionRequest, type RequestPermissionResponse, type ReadTextFileRequest, type ReadTextFileResponse, type WriteTextFileRequest, type WriteTextFileResponse, type CreateTerminalRequest, type CreateTerminalResponse, type TerminalOutputRequest, type TerminalOutputResponse, type WaitForTerminalExitRequest, type WaitForTerminalExitResponse, type KillTerminalRequest, type KillTerminalResponse, type ReleaseTerminalRequest, type ReleaseTerminalResponse } from "@agentclientprotocol/sdk";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname } from "node:path";
 import { Writable, Readable } from "node:stream";
 
 const PROVIDER_ID = "claude-code-acp";
-
-const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
-	read: "read",
-	write: "write",
-	edit: "edit",
-	bash: "bash",
-	grep: "grep",
-	glob: "find",
-};
-
-const PI_TO_SDK_TOOL_NAME: Record<string, string> = {
-	read: "Read",
-	write: "Write",
-	edit: "Edit",
-	bash: "Bash",
-	grep: "Grep",
-	find: "Glob",
-	glob: "Glob",
-};
-
-const BUILTIN_TOOL_NAMES = new Set(Object.keys(PI_TO_SDK_TOOL_NAME));
-
-// ACP ToolKind → pi tool name
-const TOOL_KIND_TO_PI: Record<string, string> = {
-	read: "read",
-	edit: "edit",
-	execute: "bash",
-	search: "grep",
-};
-
-const SKILLS_ALIAS_GLOBAL = "~/.claude/skills";
-const SKILLS_ALIAS_PROJECT = ".claude/skills";
-const GLOBAL_SKILLS_ROOT = join(homedir(), ".pi", "agent", "skills");
-const PROJECT_SKILLS_ROOT = join(process.cwd(), ".pi", "skills");
-const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
-const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
-const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
 
 const LATEST_MODEL_IDS = new Set(["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]);
 
@@ -61,25 +22,10 @@ const MODELS = getModels("anthropic")
 		maxTokens: model.maxTokens,
 	}));
 
-type SettingSource = "user" | "project" | "local";
-
-type ProviderSettings = {
-	appendSystemPrompt?: boolean;
-	settingSources?: SettingSource[];
-	strictMcpConfig?: boolean;
-};
-
 // --- Prompt building ---
 
-function buildPromptText(
-	context: Context,
-	systemPromptAppend?: string,
-): string {
+function buildPromptText(context: Context): string {
 	const parts: string[] = [];
-
-	if (systemPromptAppend) {
-		parts.push(systemPromptAppend);
-	}
 
 	for (const message of context.messages) {
 		if (message.role === "user") {
@@ -152,238 +98,6 @@ function assistantContentToText(
 			return `[${block.type}]`;
 		})
 		.join("\n");
-}
-
-// --- Tool name/arg mapping (kept for mapping ACP tool titles back to pi names) ---
-
-function mapToolName(name: string): string {
-	const normalized = name.toLowerCase();
-	const builtin = SDK_TO_PI_TOOL_NAME[normalized];
-	if (builtin) return builtin;
-	return name;
-}
-
-function mapToolArgs(
-	toolName: string,
-	args: Record<string, unknown> | undefined,
-	allowSkillAliasRewrite = true,
-): Record<string, unknown> {
-	const normalized = toolName.toLowerCase();
-	const input = args ?? {};
-	const resolvePath = (value: unknown) => (allowSkillAliasRewrite ? rewriteSkillAliasPath(value) : value);
-
-	switch (normalized) {
-		case "read":
-			return {
-				path: resolvePath(input.file_path ?? input.path),
-				offset: input.offset,
-				limit: input.limit,
-			};
-		case "write":
-			return {
-				path: resolvePath(input.file_path ?? input.path),
-				content: input.content,
-			};
-		case "edit":
-			return {
-				path: resolvePath(input.file_path ?? input.path),
-				oldText: input.old_string ?? input.oldText ?? input.old_text,
-				newText: input.new_string ?? input.newText ?? input.new_text,
-			};
-		case "bash":
-			return {
-				command: input.command,
-				timeout: input.timeout,
-			};
-		case "grep":
-			return {
-				pattern: input.pattern,
-				path: resolvePath(input.path),
-				glob: input.glob,
-				limit: input.head_limit ?? input.limit,
-			};
-		case "find":
-			return {
-				pattern: input.pattern,
-				path: resolvePath(input.path),
-			};
-		default:
-			return input;
-	}
-}
-
-// --- Settings & config ---
-
-function loadProviderSettings(): ProviderSettings {
-	const globalSettings = readSettingsFile(GLOBAL_SETTINGS_PATH);
-	const projectSettings = readSettingsFile(PROJECT_SETTINGS_PATH);
-	return { ...globalSettings, ...projectSettings };
-}
-
-function readSettingsFile(filePath: string): ProviderSettings {
-	if (!existsSync(filePath)) return {};
-	try {
-		const raw = readFileSync(filePath, "utf-8");
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		const settingsBlock =
-			(parsed["claudeCodeAcp"] as Record<string, unknown> | undefined) ??
-			(parsed["claude-code-acp"] as Record<string, unknown> | undefined) ??
-			(parsed["claudeAgentSdkProvider"] as Record<string, unknown> | undefined) ??
-			(parsed["claude-agent-sdk-provider"] as Record<string, unknown> | undefined) ??
-			(parsed["claudeAgentSdk"] as Record<string, unknown> | undefined);
-		if (!settingsBlock || typeof settingsBlock !== "object") return {};
-		const appendSystemPrompt =
-			typeof settingsBlock["appendSystemPrompt"] === "boolean"
-				? settingsBlock["appendSystemPrompt"]
-				: undefined;
-
-		const settingSourcesRaw = settingsBlock["settingSources"];
-		const settingSources =
-			Array.isArray(settingSourcesRaw) &&
-			settingSourcesRaw.every(
-				(value) =>
-					typeof value === "string" && (value === "user" || value === "project" || value === "local"),
-			)
-				? (settingSourcesRaw as SettingSource[])
-				: undefined;
-
-		const strictMcpConfig =
-			typeof settingsBlock["strictMcpConfig"] === "boolean" ? settingsBlock["strictMcpConfig"] : undefined;
-
-		return { appendSystemPrompt, settingSources, strictMcpConfig };
-	} catch {
-		return {};
-	}
-}
-
-// --- Skills & AGENTS.md ---
-
-function extractSkillsAppend(systemPrompt?: string): string | undefined {
-	if (!systemPrompt) return undefined;
-	const startMarker = "The following skills provide specialized instructions for specific tasks.";
-	const endMarker = "</available_skills>";
-	const startIndex = systemPrompt.indexOf(startMarker);
-	if (startIndex === -1) return undefined;
-	const endIndex = systemPrompt.indexOf(endMarker, startIndex);
-	if (endIndex === -1) return undefined;
-	const skillsBlock = systemPrompt.slice(startIndex, endIndex + endMarker.length).trim();
-	return rewriteSkillsLocations(skillsBlock);
-}
-
-function rewriteSkillsLocations(skillsBlock: string): string {
-	return skillsBlock.replace(/<location>([^<]+)<\/location>/g, (_match, location: string) => {
-		let rewritten = location;
-		if (location.startsWith(GLOBAL_SKILLS_ROOT)) {
-			const relPath = relative(GLOBAL_SKILLS_ROOT, location).replace(/^\.+/, "");
-			rewritten = `${SKILLS_ALIAS_GLOBAL}/${relPath}`.replace(/\/\/+/g, "/");
-		} else if (location.startsWith(PROJECT_SKILLS_ROOT)) {
-			const relPath = relative(PROJECT_SKILLS_ROOT, location).replace(/^\.+/, "");
-			rewritten = `${SKILLS_ALIAS_PROJECT}/${relPath}`.replace(/\/\/+/g, "/");
-		}
-		return `<location>${rewritten}</location>`;
-	});
-}
-
-function resolveAgentsMdPath(): string | undefined {
-	const fromCwd = findAgentsMdInParents(process.cwd());
-	if (fromCwd) return fromCwd;
-	if (existsSync(GLOBAL_AGENTS_PATH)) return GLOBAL_AGENTS_PATH;
-	return undefined;
-}
-
-function findAgentsMdInParents(startDir: string): string | undefined {
-	let current = resolve(startDir);
-	while (true) {
-		const candidate = join(current, "AGENTS.md");
-		if (existsSync(candidate)) return candidate;
-		const parent = dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return undefined;
-}
-
-function extractAgentsAppend(): string | undefined {
-	const agentsPath = resolveAgentsMdPath();
-	if (!agentsPath) return undefined;
-	try {
-		const content = readFileSync(agentsPath, "utf-8").trim();
-		if (!content) return undefined;
-		const sanitized = sanitizeAgentsContent(content);
-		return sanitized.length > 0 ? `# CLAUDE.md\n\n${sanitized}` : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function sanitizeAgentsContent(content: string): string {
-	let sanitized = content;
-	sanitized = sanitized.replace(/~\/\.pi\b/gi, "~/.claude");
-	sanitized = sanitized.replace(/(^|[\s'"`])\.pi\//g, "$1.claude/");
-	sanitized = sanitized.replace(/\b\.pi\b/gi, ".claude");
-	sanitized = sanitized.replace(/\bpi\b/gi, "environment");
-	return sanitized;
-}
-
-function rewriteSkillAliasPath(pathValue: unknown): unknown {
-	if (typeof pathValue !== "string") return pathValue;
-	if (pathValue.startsWith(SKILLS_ALIAS_GLOBAL)) {
-		return pathValue.replace(SKILLS_ALIAS_GLOBAL, "~/.pi/agent/skills");
-	}
-	if (pathValue.startsWith(`./${SKILLS_ALIAS_PROJECT}`)) {
-		return pathValue.replace(`./${SKILLS_ALIAS_PROJECT}`, PROJECT_SKILLS_ROOT);
-	}
-	if (pathValue.startsWith(SKILLS_ALIAS_PROJECT)) {
-		return pathValue.replace(SKILLS_ALIAS_PROJECT, PROJECT_SKILLS_ROOT);
-	}
-	const projectAliasAbs = join(process.cwd(), SKILLS_ALIAS_PROJECT);
-	if (pathValue.startsWith(projectAliasAbs)) {
-		return pathValue.replace(projectAliasAbs, PROJECT_SKILLS_ROOT);
-	}
-	return pathValue;
-}
-
-// --- Thinking budgets (kept for future use) ---
-
-type ThinkingLevel = NonNullable<SimpleStreamOptions["reasoning"]>;
-type NonXhighThinkingLevel = Exclude<ThinkingLevel, "xhigh">;
-
-const DEFAULT_THINKING_BUDGETS: Record<NonXhighThinkingLevel, number> = {
-	minimal: 2048,
-	low: 8192,
-	medium: 16384,
-	high: 31999,
-};
-
-const OPUS_46_THINKING_BUDGETS: Record<ThinkingLevel, number> = {
-	minimal: 2048,
-	low: 8192,
-	medium: 31999,
-	high: 63999,
-	xhigh: 63999,
-};
-
-function mapThinkingTokens(
-	reasoning?: ThinkingLevel,
-	modelId?: string,
-	thinkingBudgets?: SimpleStreamOptions["thinkingBudgets"],
-): number | undefined {
-	if (!reasoning) return undefined;
-
-	const isOpus46 = modelId?.includes("opus-4-6") || modelId?.includes("opus-4.6");
-	if (isOpus46) {
-		return OPUS_46_THINKING_BUDGETS[reasoning];
-	}
-
-	const effectiveReasoning: NonXhighThinkingLevel = reasoning === "xhigh" ? "high" : reasoning;
-
-	const customBudgets = thinkingBudgets as (Partial<Record<NonXhighThinkingLevel, number>> | undefined);
-	const customBudget = customBudgets?.[effectiveReasoning];
-	if (typeof customBudget === "number" && Number.isFinite(customBudget) && customBudget > 0) {
-		return customBudget;
-	}
-
-	return DEFAULT_THINKING_BUDGETS[effectiveReasoning];
 }
 
 // --- ACP connection management ---
@@ -625,7 +339,6 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 		const blocks = output.content as Array<
 			| { type: "text"; text: string }
 			| { type: "thinking"; thinking: string }
-			| { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> }
 		>;
 
 		let started = false;
@@ -643,13 +356,9 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 		try {
 			const connection = await ensureConnection();
 
-			// Build system prompt append
-			const providerSettings = loadProviderSettings();
-			const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
-			const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
-			const skillsAppend = appendSystemPrompt ? extractSkillsAppend(context.systemPrompt) : undefined;
-			const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
-			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
+			// TODO: consider prepending pi skills or other pi-specific context to
+			// the first prompt. Claude Code loads its own CLAUDE.md so we don't
+			// send that, but pi skills aren't visible to Claude Code.
 
 			// Determine if we need a new session or can reuse
 			let promptText: string;
@@ -661,7 +370,7 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 				await connection.setSessionMode({ sessionId, modeId: "bypassPermissions" });
 				await connection.unstable_setSessionModel({ sessionId, modelId: model.id });
 				activeModelId = model.id;
-				promptText = buildPromptText(context, systemPromptAppend);
+				promptText = buildPromptText(context);
 				lastContextLength = context.messages.length;
 			} else {
 				// Continuation — ACP already has prior context, just send latest user message
