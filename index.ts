@@ -640,9 +640,6 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 			}
 		};
 
-		// Track tool call IDs to content block indices
-		const toolCallIndexMap = new Map<string, number>();
-
 		try {
 			const connection = await ensureConnection();
 
@@ -727,47 +724,10 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 						break;
 					}
 
-					case "tool_call": {
-						const tc = update as ToolCall & { sessionUpdate: string };
-						// Close any open text block before tool call
-						if (textBlockIndex !== -1) {
-							const textBlock = blocks[textBlockIndex] as { type: "text"; text: string };
-							stream.push({ type: "text_end", contentIndex: textBlockIndex, content: textBlock.text, partial: output });
-							textBlockIndex = -1;
-						}
-						// Map tool name: prefer kind → pi mapping, fall back to title first word
-						const kindName = tc.kind ? TOOL_KIND_TO_PI[tc.kind] : undefined;
-						const titleFirst = tc.title.split(" ")[0] || tc.title;
-						const piToolName = kindName ?? mapToolName(titleFirst);
-						const args = (tc.rawInput && typeof tc.rawInput === "object")
-							? tc.rawInput as Record<string, unknown>
-							: {};
-
-						const block = {
-							type: "toolCall" as const,
-							id: tc.toolCallId,
-							name: piToolName,
-							arguments: args,
-						};
-						blocks.push(block);
-						const idx = blocks.length - 1;
-						toolCallIndexMap.set(tc.toolCallId, idx);
-						stream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
+					case "tool_call":
+					case "tool_call_update":
+						// ACP executes tools internally — don't emit to pi
 						break;
-					}
-
-					case "tool_call_update": {
-						const tc = update as ToolCallUpdate & { sessionUpdate: string };
-						const idx = toolCallIndexMap.get(tc.toolCallId);
-						if (idx != null && (tc.status === "completed" || tc.status === "failed")) {
-							const block = blocks[idx] as { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
-							if (tc.rawInput && typeof tc.rawInput === "object") {
-								block.arguments = tc.rawInput as Record<string, unknown>;
-							}
-							stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: block, partial: output });
-						}
-						break;
-					}
 
 					case "usage_update": {
 						const usage = update as { used?: number; size?: number; cost?: { total?: number } } & { sessionUpdate: string };
