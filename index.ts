@@ -31,6 +31,14 @@ const PI_TO_SDK_TOOL_NAME: Record<string, string> = {
 
 const BUILTIN_TOOL_NAMES = new Set(Object.keys(PI_TO_SDK_TOOL_NAME));
 
+// ACP ToolKind → pi tool name
+const TOOL_KIND_TO_PI: Record<string, string> = {
+	read: "read",
+	edit: "edit",
+	execute: "bash",
+	search: "grep",
+};
+
 const SKILLS_ALIAS_GLOBAL = "~/.claude/skills";
 const SKILLS_ALIAS_PROJECT = ".claude/skills";
 const GLOBAL_SKILLS_ROOT = join(homedir(), ".pi", "agent", "skills");
@@ -734,10 +742,10 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 							stream.push({ type: "text_end", contentIndex: textBlockIndex, content: textBlock.text, partial: output });
 							textBlockIndex = -1;
 						}
-						// Extract tool name from title (e.g., "Read src/foo.ts" → "Read")
-						const titleParts = tc.title.split(" ");
-						const rawToolName = titleParts[0] || tc.title;
-						const piToolName = mapToolName(rawToolName);
+						// Map tool name: prefer kind → pi mapping, fall back to title first word
+						const kindName = tc.kind ? TOOL_KIND_TO_PI[tc.kind] : undefined;
+						const titleFirst = tc.title.split(" ")[0] || tc.title;
+						const piToolName = kindName ?? mapToolName(titleFirst);
 						const args = tc.rawInput
 							? mapToolArgs(piToolName, tc.rawInput as Record<string, unknown>)
 							: {};
