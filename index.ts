@@ -37,6 +37,7 @@ interface Config {
 		label?: string;
 		description?: string;
 		defaultMode?: "full" | "read" | "none";
+		appendSkills?: boolean;  // default true — forward pi's skills to Claude Code
 	};
 }
 
@@ -108,6 +109,16 @@ function buildActionSummary(calls: Map<string, ToolCallState>): string {
 	if (commands.length) parts.push(`ran ${commands.join("; ")}`);
 	if (other.length) parts.push(other.join("; "));
 	return parts.join("; ");
+}
+
+function extractSkillsBlock(systemPrompt: string): string | undefined {
+	const startMarker = "The following skills provide specialized instructions for specific tasks.";
+	const endMarker = "</available_skills>";
+	const start = systemPrompt.indexOf(startMarker);
+	if (start === -1) return undefined;
+	const end = systemPrompt.indexOf(endMarker, start);
+	if (end === -1) return undefined;
+	return systemPrompt.slice(start, end + endMarker.length).trim();
 }
 
 const MODE_PRESETS: Record<string, Record<string, unknown>> = {
@@ -472,15 +483,30 @@ async function promptAndWait(
 	mode: "full" | "read" | "none",
 	toolCalls: Map<string, ToolCallState>,
 	signal?: AbortSignal,
-	onStreamUpdate?: (responseText: string) => void,
+	options?: { systemPrompt?: string; appendSkills?: boolean; onStreamUpdate?: (responseText: string) => void },
 ): Promise<{ responseText: string; stopReason: string }> {
 	const connection = await ensureConnection();
 
-	const meta = MODE_PRESETS[mode] ?? {};
+	// Build _meta: mode preset + skills append + MCP suppression
+	const modePreset = MODE_PRESETS[mode] ?? {};
+	const skillsBlock = options?.appendSkills !== false && options?.systemPrompt
+		? extractSkillsBlock(options.systemPrompt) : undefined;
+
+	const meta: Record<string, unknown> = {
+		...modePreset,
+		...(skillsBlock ? { systemPrompt: { append: skillsBlock } } : {}),
+		claudeCode: {
+			options: {
+				...(modePreset as any).claudeCode?.options,
+				extraArgs: { "strict-mcp-config": null },
+			},
+		},
+	};
+
 	const session = await connection.newSession({
 		cwd: process.cwd(),
 		mcpServers: [],
-		...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
+		_meta: meta,
 	} as any);
 	const sid = session.sessionId;
 	await connection.setSessionMode({ sessionId: sid, modeId: "bypassPermissions" });
@@ -493,7 +519,7 @@ async function promptAndWait(
 				const content = update.content;
 				if (content.type === "text" && "text" in content) {
 					responseText += (content as { text: string }).text;
-					onStreamUpdate?.(responseText);
+					options?.onStreamUpdate?.(responseText);
 				}
 				break;
 			}
@@ -909,7 +935,10 @@ export default function (pi: ExtensionAPI) {
 				}, 1000);
 
 				try {
-					const result = await promptAndWait(params.prompt, mode, toolCalls, signal);
+					const result = await promptAndWait(params.prompt, mode, toolCalls, signal, {
+						systemPrompt: ctx.getSystemPrompt(),
+						appendSkills: askConf?.appendSkills,
+					});
 					clearInterval(progressInterval);
 					const executionTime = Date.now() - start;
 					const actions = buildActionSummary(toolCalls);

@@ -38,7 +38,7 @@ Available when using any non-claude-code-acp provider. Pi's LLM can delegate to 
   - `"read"`: read-only codebase access — for review, analysis, research
   - `"none"`: no tools, reasoning only — for general questions, brainstorming
 
-Claude Code's tools are auto-approved (bypass permissions mode).
+Claude Code's tools are auto-approved (bypass permissions mode). Pre-existing MCP servers from user/project config are suppressed via `--strict-mcp-config`. Pi's skills are forwarded to Claude Code's system prompt so it has the same skill awareness as pi.
 
 ## Configuration
 
@@ -51,18 +51,20 @@ Config files: `~/.pi/agent/claude-code-acp.json` (global) and `.pi/claude-code-a
     "name": "AskClaude",
     "label": "Ask Claude Code",
     "description": "Custom tool description override",
-    "defaultMode": "full"
+    "defaultMode": "full",
+    "appendSkills": true
   }
 }
 ```
 
-Set `"enabled": false` to disable the AskClaude tool registration.
+- `"enabled": false` — disable the AskClaude tool
+- `"appendSkills": false` — don't forward pi's skills to Claude Code
 
 ## Limitations
 
-**AskClaude has no shared context with pi.** Each call creates a fresh Claude Code session. Claude Code doesn't see pi's conversation history, skills, or AGENTS.md. The calling LLM must pack relevant context into the prompt string. Both skills forwarding and persistent sessions are solvable (see TODOs).
+**AskClaude has no shared conversation history.** Each call creates a fresh Claude Code session. The calling LLM must pack relevant context into the prompt string. Persistent sessions are planned (see TODOs).
 
-**Claude Code may load extra MCP tools** from `~/.claude.json` or `.mcp.json`. Solvable via `_meta.claudeCode.options.extraArgs: { "strict-mcp-config": null }` or explicit `allowedTools` (see TODOs).
+**MCP suppression is untested.** `--strict-mcp-config` is passed via `extraArgs` in `_meta` — this may not work through the ACP bridge. If MCP tools leak through, the fallback is explicit `allowedTools` in all modes.
 
 See [docs/acp-meta-reference.md](docs/acp-meta-reference.md) for the full set of available ACP `_meta` options.
 
@@ -74,5 +76,4 @@ See [docs/acp-meta-reference.md](docs/acp-meta-reference.md) for the full set of
   - **displayOnly message**: `sendMessage` with `display: true` + `displayOnly` detail, filtered from LLM context via `on("context")`. Proven pattern from `extensions/claude-acp.ts`.
   - **Overlay**: `ctx.ui.custom()` with `{ overlay: true }` for a dismissible panel.
   - Stream progress into a widget during execution, clear on next user input via `on("input")`.
-- **Forward pi's skills and AGENTS.md** to Claude Code via `_meta.systemPrompt.append`. Hook `before_agent_start` or use `ctx.getSystemPrompt()` to capture pi's system prompt, extract the `<available_skills>` block (see `extractSkillsAppend()` in `claude-agent-sdk-pi/index.ts`), and pass via `_meta: { systemPrompt: { append: skillsBlock } }` in `newSession`. This appends to Claude Code's default system prompt — same mechanism the Agent SDK uses.
-- **Suppress Claude Code's MCP tools.** Two approaches: (a) pass `_meta: { claudeCode: { options: { extraArgs: { "strict-mcp-config": null } } } }` to ignore MCP servers from config files, (b) use explicit `allowedTools` listing only built-in tool names to exclude `mcp__*` patterns. Both need testing.
+- **Verify MCP suppression** — test that `extraArgs: { "strict-mcp-config": null }` actually prevents MCP server loading through ACP. If not, fall back to explicit `allowedTools` in all modes.
