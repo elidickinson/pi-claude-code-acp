@@ -732,15 +732,10 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 						// All tool calls go through MCP bridge → Pi executes them
 						break;
 
-					case "usage_update": {
-						const usage = update as { used?: number; size?: number } & { sessionUpdate: string };
-						if (usage.used != null) {
-							output.usage.totalTokens = usage.used;
-							output.usage.input = usage.used;
-						}
-						calculateCost(model, output.usage);
-						break;
-					}
+				// Note: We intentionally do NOT update usage from streaming 'usage_update'
+				// events. Token counts are taken from the final PromptResponse.usage,
+				// which is the authoritative source. Streaming approximations are
+				// unnecessary since we don't display real-time tok/s.
 
 					default:
 						break;
@@ -805,6 +800,15 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 					}
 
 					const result = (raceResult as { kind: "done"; result: PromptResponse }).result;
+					// Populate final token usage from PromptResponse if available
+					if (result.usage) {
+						output.usage.input = result.usage.inputTokens;
+						output.usage.output = result.usage.outputTokens;
+						output.usage.cacheRead = result.usage.cachedReadTokens ?? 0;
+						output.usage.cacheWrite = result.usage.cachedWriteTokens ?? 0;
+						output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+						calculateCost(model, output.usage);
+					}
 					output.stopReason = result.stopReason === "cancelled" ? "aborted" : "stop";
 					pushStart();
 					stream.push({ type: "done", reason: "stop", message: output });
