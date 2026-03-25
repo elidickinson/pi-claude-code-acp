@@ -1,7 +1,5 @@
 # pi-claude-code-acp
 
-![screenshot](screenshot.png)
-
 Pi extension that integrates Claude Code via ACP (Agent Client Protocol). Provides two ways to use Claude Code from pi:
 
 1. **Provider** — Offers Opus/Sonnet/Haiku as models that can be selected in pi like usual
@@ -14,6 +12,10 @@ It a little janky, but actually mostly works!
 This is a heavily reworked fork of [claude-agent-sdk-pi](https://github.com/prateekmedia/claude-agent-sdk-pi), which does a similar thing using the Agent SDK. The advantage of ACP over the Agent SDK or pi's built-in Claude Code emulation is that (I believe) the ACP approach is a fully compliant way to use Claude Max/Pro subscription. It follows the rules: only the real Claude Code touches Anthropic's API and requests are part of a user-driven coding session.
 
 (IANAL and obviously this extension is unofficial and neither endorsed nor supported by Anthropic.)
+
+## Example
+
+![screenshot](screenshot.png)
 
 ## Setup
 
@@ -41,6 +43,12 @@ Claude Code handles tool execution internally via ACP. Pi's tools are forwarded 
 
 Available when using any non-claude-code-acp provider. Pi's LLM can delegate to Claude Code for second opinions, analysis, or autonomous tasks.
 
+**Default tool description** (what pi sees):
+
+> **AskClaude** - Delegate to Claude Code. Use for: analysis and second opinions (code review, architecture questions, debugging theories), or autonomous tasks (implement a feature, fix a bug, refactor code). Use the mode parameter to control tool access. Prefer to handle straightforward tasks yourself.
+
+You can override this via config (see Configuration below) to steer when the LLM calls AskClaude. For example, in a skill or AGENTS.md you could add instructions like "Always call AskClaude in read mode to review any complicated feature implementations before the task can be considered complete."
+
 **Parameters:**
 - `prompt` — the question or task (include relevant context — Claude Code has no conversation history)
 - `mode` — tool access preset:
@@ -48,7 +56,7 @@ Available when using any non-claude-code-acp provider. Pi's LLM can delegate to 
   - `"read"`: read-only codebase access — for review, analysis, research
   - `"none"`: no tools, reasoning only — for general questions, brainstorming
 
-Claude Code's tools are currently auto-approved (bypass permissions mode) — it can read, write, and run commands without user confirmation. The `mode` parameter is the primary control over what Claude Code can do. This may change in future versions to support more granular permission control. Pre-existing MCP servers from user/project config are suppressed via `--strict-mcp-config`. Pi's skills are forwarded to Claude Code's system prompt so it has the same skill awareness as pi.
+Claude Code's tools are auto-approved (bypass permissions mode). The `mode` parameter is the primary control over what Claude Code can do. Pre-existing MCP servers from user/project config are suppressed via `--strict-mcp-config`. Pi's skills are forwarded to Claude Code's system prompt.
 
 ## Configuration
 
@@ -76,7 +84,7 @@ Config files: `~/.pi/agent/claude-code-acp.json` (global) and `.pi/claude-code-a
 
 **Claude Code loads its own skills** from `~/.claude/skills/` and `.claude/skills/` in addition to the pi skills we forward. These are additive — Claude Code may have skills pi doesn't know about.
 
-**Provider context awkward when switching to claude-code-acp provider** When switching to claude-code-acp from another model provider during a session, only the last 20 messages are sent (includes tool results, so roughly 3-5 full exchanges). The messages are also crammed into the first user prompt since there's no way to insert messages into Claude Code's history.
+**Provider context awkward when switching between providers** When switching to claude-code-acp from another provider during a session, we send the last 20 messages as part of the prompt (these messages includes tool results, so roughly 3-5 full exchanges). There's no clean way to insert messages created outside of Claude Code into its history, but this hack seems to work OK.
 
 See [docs/acp-meta-reference.md](docs/acp-meta-reference.md) for the full set of available ACP `_meta` options.
 

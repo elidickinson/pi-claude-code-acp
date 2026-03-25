@@ -874,7 +874,7 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 
 // --- Provider + tool registration ---
 
-const DEFAULT_TOOL_DESCRIPTION = "Delegate to Claude Code. Use for: analysis and second opinions (code review, architecture questions, debugging theories), or autonomous tasks (implement a feature, fix a bug, refactor code). Claude Code's tools are auto-approved — it can read, write, and run commands without user confirmation. Prefer to handle straightforward tasks yourself.";
+const DEFAULT_TOOL_DESCRIPTION = "Delegate to Claude Code. Use for: analysis and second opinions (code review, architecture questions, debugging theories), or autonomous tasks (implement a feature, fix a bug, refactor code). Use the mode parameter to control tool access. Prefer to handle straightforward tasks yourself.";
 
 const PREVIEW_MAX_CHARS = 1000;
 const PREVIEW_MAX_LINES = 6;

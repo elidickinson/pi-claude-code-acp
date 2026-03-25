@@ -17,6 +17,7 @@
     "index.ts",
     "README.md",
     "LICENSE",
+    "screenshot.png",
     "docs/"
   ],
   "type": "module",
