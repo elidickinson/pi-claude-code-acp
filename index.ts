@@ -50,6 +50,7 @@ interface Config {
 		label?: string;
 		description?: string;
 		defaultMode?: "full" | "read" | "none";
+		allowFullMode?: boolean;  // default false — enable full (read+write+run) mode
 		appendSkills?: boolean;  // default true — forward pi's skills to Claude Code
 	};
 }
@@ -142,8 +143,9 @@ const MODE_PRESETS: Record<string, Record<string, unknown>> = {
 
 // --- Provider helpers ---
 
-function getToolsForMcp(tools?: Tool[]): Tool[] {
-	return tools ?? [];
+function getToolsForMcp(tools?: Tool[], excludeName?: string): Tool[] {
+	if (!tools) return [];
+	return excludeName ? tools.filter(t => t.name !== excludeName) : tools;
 }
 
 // --- Prompt building ---
@@ -595,6 +597,8 @@ function waitForToolCall(): Promise<void> {
 	});
 }
 
+let askClaudeToolName = "AskClaude";
+
 function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
@@ -650,7 +654,7 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 
 		try {
 			const connection = await ensureConnection();
-			const tools = getToolsForMcp(context.tools);
+			const tools = getToolsForMcp(context.tools, askClaudeToolName);
 
 			// --- Mode B: Resume with tool result ---
 			if (activePromise && pendingToolCall) {
@@ -874,7 +878,8 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 
 // --- Provider + tool registration ---
 
-const DEFAULT_TOOL_DESCRIPTION = "Delegate to Claude Code. Use for: analysis and second opinions (code review, architecture questions, debugging theories), or autonomous tasks (implement a feature, fix a bug, refactor code). Use the mode parameter to control tool access. Prefer to handle straightforward tasks yourself.";
+const DEFAULT_TOOL_DESCRIPTION_FULL = "Delegate to Claude Code for a second opinion or analysis (code review, architecture questions, debugging theories), or to autonomously handle a task. Defaults to read-only mode — use full mode when the user wants to delegate a task that requires changes. Prefer to handle straightforward tasks yourself.";
+const DEFAULT_TOOL_DESCRIPTION = "Delegate to Claude Code for a second opinion or analysis (code review, architecture questions, debugging theories). Read-only — Claude Code can explore the codebase but not make changes. Prefer to handle straightforward tasks yourself.";
 
 const PREVIEW_MAX_CHARS = 1000;
 const PREVIEW_MAX_LINES = 6;
@@ -897,18 +902,22 @@ export default function (pi: ExtensionAPI) {
 	// --- AskClaude tool ---
 
 	const askConf = config.askClaude;
-	const defaultMode = askConf?.defaultMode ?? "full";
+	const allowFull = askConf?.allowFullMode === true;
+	const defaultMode = askConf?.defaultMode ?? "read";
+	askClaudeToolName = askConf?.name ?? "AskClaude";
+
+	const modeValues = allowFull ? ["read", "full", "none"] as const : ["read", "none"] as const;
+	let modeDesc = `"read" (default): questions about the codebase — review, analysis, explain. "none": general knowledge only (no file access).`;
+	if (allowFull) modeDesc += ` "full": allows writing and bash execution (careful: runs without feedback to pi).`;
 
 	if (askConf?.enabled !== false) {
 		pi.registerTool({
 			name: askConf?.name ?? "AskClaude",
 			label: askConf?.label ?? "Ask Claude Code",
-			description: askConf?.description ?? DEFAULT_TOOL_DESCRIPTION,
+			description: askConf?.description ?? (allowFull ? DEFAULT_TOOL_DESCRIPTION_FULL : DEFAULT_TOOL_DESCRIPTION),
 			parameters: Type.Object({
 				prompt: Type.String({ description: "The question or task for Claude Code. Claude only sees this prompt (no conversation history) — include the user's original question and any relevant context. Don't research up front, let Claude explore." }),
-				mode: Type.Optional(StringEnum(["full", "read", "none"] as const, {
-					description: `"read": questions about the codebase (review, analysis, explain). "full": tasks that need changes or shell commands. "none": questions that don't involve repo files (general knowledge, brainstorming, opinions).`,
-				})),
+				mode: Type.Optional(StringEnum(modeValues, { description: modeDesc })),
 			}),
 			renderCall(args, theme) {
 				let text = theme.fg("mdLink", theme.bold("AskClaude "));

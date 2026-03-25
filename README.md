@@ -37,7 +37,7 @@ Use `/model` to select:
 - `claude-code-acp/claude-sonnet-4-6`
 - `claude-code-acp/claude-haiku-4-5`
 
-Claude Code handles tool execution internally via ACP. Pi's tools are forwarded through an MCP bridge so Claude Code can call them. Built-in Claude Code tools are disabled in provider mode — all tool calls go through pi.
+Claude Code's built-in tools are disabled. Instead, pi's tools are forwarded through an MCP bridge so all tool calls flow through pi — this means pi sees every tool call in the TUI and maintains control. The tradeoff is that tool names show up as `mcp__pi-tools__Read` etc. instead of native names.
 
 ## AskClaude Tool
 
@@ -45,18 +45,18 @@ Available when using any non-claude-code-acp provider. Pi's LLM can delegate to 
 
 **Default tool description** (what pi sees):
 
-> **AskClaude** - Delegate to Claude Code. Use for: analysis and second opinions (code review, architecture questions, debugging theories), or autonomous tasks (implement a feature, fix a bug, refactor code). Use the mode parameter to control tool access. Prefer to handle straightforward tasks yourself.
+> **AskClaude** - Delegate to Claude Code for a second opinion or analysis (code review, architecture questions, debugging theories). Read-only — Claude Code can explore the codebase but not make changes. Prefer to handle straightforward tasks yourself.
 
-You can override this via config (see Configuration below) to steer when the LLM calls AskClaude. For example, in a skill or AGENTS.md you could add instructions like "Always call AskClaude in read mode to review any complicated feature implementations before the task can be considered complete."
+You can override this description via config (see below). You can also steer when and how AskClaude gets called by adding instructions to a skill or AGENTS.md — e.g., "Always call AskClaude in read mode to review any complicated feature implementations before the task can be considered complete."
 
 **Parameters:**
 - `prompt` — the question or task (include relevant context — Claude Code has no conversation history)
 - `mode` — tool access preset:
-  - `"full"` (default): read, write, run commands — for tasks that need changes
-  - `"read"`: read-only codebase access — for review, analysis, research
+  - `"read"` (default): read-only codebase access — for review, analysis, research
   - `"none"`: no tools, reasoning only — for general questions, brainstorming
+  - `"full"`: read, write, run commands — requires `allowFullMode: true` in config (see below)
 
-Claude Code's tools are auto-approved (bypass permissions mode). The `mode` parameter is the primary control over what Claude Code can do. Pre-existing MCP servers from user/project config are suppressed via `--strict-mcp-config`. Pi's skills are forwarded to Claude Code's system prompt.
+Unlike the provider, AskClaude uses Claude Code's own built-in tools directly (Glob, Read, etc.) — not pi's tools via MCP. This means tool calls happen inside Claude Code and pi only sees the final result. Claude Code's tools are auto-approved (bypass permissions mode). Pre-existing MCP servers from user/project config are suppressed via `--strict-mcp-config`. Pi's skills are forwarded to Claude Code's system prompt.
 
 ## Configuration
 
@@ -76,6 +76,7 @@ Config files: `~/.pi/agent/claude-code-acp.json` (global) and `.pi/claude-code-a
 ```
 
 - `"enabled": false` — disable the AskClaude tool
+- `"allowFullMode": true` — enable full mode (read + write + run). Off by default — AskClaude only offers read and none modes unless this is set.
 - `"appendSkills": false` — don't forward pi's skills to Claude Code
 
 ## Limitations
@@ -84,7 +85,9 @@ Config files: `~/.pi/agent/claude-code-acp.json` (global) and `.pi/claude-code-a
 
 **Claude Code loads its own skills** from `~/.claude/skills/` and `.claude/skills/` in addition to the pi skills we forward. These are additive — Claude Code may have skills pi doesn't know about.
 
-**Provider context awkward when switching between providers** When switching to claude-code-acp from another provider during a session, we send the last 20 messages as part of the prompt (these messages includes tool results, so roughly 3-5 full exchanges). There's no clean way to insert messages created outside of Claude Code into its history, but this hack seems to work OK.
+**Provider and AskClaude use different tool strategies.** The provider disables Claude Code's built-in tools and routes everything through pi via MCP — pi sees all tool calls but tool names appear as `mcp__pi-tools__*`. AskClaude uses Claude Code's native tools directly — faster and cleaner, but pi only sees the final result, not individual tool calls.
+
+**Provider context awkward when switching between providers.** When switching to claude-code-acp from another provider during a session, we send the last 20 messages as part of the prompt (these messages includes tool results, so roughly 3-5 full exchanges). There's no clean way to insert messages created outside of Claude Code into its history, but this hack seems to work OK.
 
 See [docs/acp-meta-reference.md](docs/acp-meta-reference.md) for the full set of available ACP `_meta` options.
 
