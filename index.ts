@@ -100,29 +100,34 @@ function tcPath(tc: ToolCallState): string | undefined {
 	return loc ?? extractPath(tc.rawInput);
 }
 
+function shortPath(p: string): string {
+	const cwd = process.cwd();
+	return p.startsWith(cwd + "/") ? p.slice(cwd.length + 1) : p;
+}
+
 function buildActionSummary(calls: Map<string, ToolCallState>): string {
-	const reads: string[] = [];
-	const edits: string[] = [];
+	const reads = new Set<string>();
+	const edits = new Set<string>();
 	const commands: string[] = [];
 	const other: string[] = [];
 
 	for (const [, tc] of calls) {
 		const path = tcPath(tc);
-		const name = tc.name.toLowerCase();
-		if (name === "read" || name === "readfile") {
-			if (path) reads.push(path);
-		} else if (name === "edit" || name === "write" || name === "writefile" || name === "multiedit") {
-			if (path) edits.push(path);
-		} else if (name === "bash" || name === "terminal") {
+		const verb = tc.name.toLowerCase().split(/\s/)[0];
+		if (verb === "read" || verb === "readfile") {
+			if (path) reads.add(shortPath(path));
+		} else if (verb === "edit" || verb === "write" || verb === "writefile" || verb === "multiedit") {
+			if (path) edits.add(shortPath(path));
+		} else if (verb === "bash" || verb === "terminal") {
 			commands.push(path ?? "command");
 		} else {
-			other.push(tc.name + (path ? ` ${path}` : ""));
+			other.push(tc.name);
 		}
 	}
 
 	const parts: string[] = [];
-	if (reads.length) parts.push(`read ${reads.join(", ")}`);
-	if (edits.length) parts.push(`edited ${edits.join(", ")}`);
+	if (reads.size) parts.push(`read ${[...reads].join(", ")}`);
+	if (edits.size) parts.push(`edited ${[...edits].join(", ")}`);
 	if (commands.length) parts.push(`ran ${commands.join("; ")}`);
 	if (other.length) parts.push(other.join("; "));
 	return parts.join("; ");
