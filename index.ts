@@ -590,7 +590,7 @@ async function promptAndWait(
 	const sid = session.sessionId;
 	// Not strictly needed (requestPermission callback auto-approves) but avoids per-tool round-trip latency
 	await connection.setSessionMode({ sessionId: sid, modeId: "bypassPermissions" });
-	await connection.unstable_setSessionModel({ sessionId: sid, modelId: resolveModelId(options?.model ?? "sonnet") });
+	await connection.unstable_setSessionModel({ sessionId: sid, modelId: resolveModelId(options?.model ?? "opus") });
 
 	let responseText = "";
 
@@ -1009,7 +1009,7 @@ export default function (pi: ExtensionAPI) {
 			parameters: Type.Object({
 				prompt: Type.String({ description: "The question or task for Claude Code. Claude only sees this prompt (no conversation history) — include the user's original question and any relevant context. Don't research up front, let Claude explore." }),
 				mode: Type.Optional(StringEnum(modeValues, { description: modeDesc })),
-				model: Type.Optional(Type.String({ description: 'Claude model (e.g. "opus", "sonnet", "haiku", or full ID). Defaults to "sonnet".' })),
+				model: Type.Optional(Type.String({ description: 'Claude model (e.g. "opus", "sonnet", "haiku", or full ID). Defaults to "opus".' })),
 				thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, { description: 'Thinking effort level. Defaults to "medium".' })),
 			}),
 			renderCall(args, theme) {
