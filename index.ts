@@ -610,7 +610,9 @@ async function promptAndWait(
 		sid = session.sessionId;
 		await connection.setSessionMode({ sessionId: sid, modeId: "bypassPermissions" });
 	} else {
-		// Shared mode (default): mirror pi context into CC session, kill/reconnect to resume
+		// Shared mode (default): mirror pi context into CC session, kill/reconnect to resume.
+		// Safe to killConnection: AskClaude is only callable when a non-ACP model is active
+		// (execute guard rejects calls from the ACP provider), so no activePromise exists.
 		if (options?.context && options.context.length > 0) {
 			ensureMirrorSession(options.context, cwd, true);
 		}
@@ -816,7 +818,8 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 					// Continuation — reuse existing session
 					sessionId = activeSessionId;
 					const missed = context.messages.slice(mirrorCursor, -1);
-					if (missed.length > 0 && mirrorSessionId) {
+					if (missed.length > 0) {
+						if (!mirrorSessionId) throw new Error("mirrorSessionId must be set when activeSessionId exists");
 						ensureMirrorSession(missed, cwd, true);
 
 						killConnection();
@@ -832,7 +835,7 @@ function streamClaudeAcp(model: Model<any>, context: Context, options?: SimpleSt
 					mirrorCursor = context.messages.length;
 				}
 
-				activePromise = acpConnection!.prompt({
+				activePromise = connection.prompt({
 					sessionId: sessionId!,
 					prompt: [{ type: "text", text: lastUserText }],
 				});
@@ -1040,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
 				prompt: Type.String({ description: "The question or task for Claude Code. By default Claude sees the full conversation history. Don't research up front, let Claude explore." }),
 				mode: Type.Optional(StringEnum(modeValues, { description: modeDesc })),
 				model: Type.Optional(Type.String({ description: 'Claude model (e.g. "opus", "sonnet", "haiku", or full ID). Defaults to "opus".' })),
-				thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, { description: 'Thinking effort level. Defaults to "medium".' })),
+				thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, { description: "Thinking effort level. Omit to use Claude Code's default." })),
 				isolated: Type.Optional(Type.Boolean({ description: "When true, Claude sees only this prompt (clean session). When false (default), Claude sees the full conversation history." })),
 			}),
 			renderCall(args, theme) {
