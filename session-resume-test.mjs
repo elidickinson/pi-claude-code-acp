@@ -24,7 +24,7 @@ const TIMEOUT = 180_000;
 
 const BRIDGE_MODEL = "claude-bridge/claude-haiku-4-5";
 const OTHER_PROVIDER = "openrouter";
-const OTHER_MODEL = "openai/gpt-oss-120b";
+const OTHER_MODEL = "openai/gpt-5-nano";
 
 // Random words to avoid Claude memorizing test values across runs
 const WORD_A = `alpha${Math.random().toString(36).slice(2, 6)}`;
