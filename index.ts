@@ -1,6 +1,7 @@
 import { calculateCost, createAssistantMessageEventStream, getModels, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import { buildSessionContext, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 import { pascalCase } from "change-case";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
@@ -542,10 +543,17 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	return { mcpTools, customToolNameToSdk, customToolNameToPi };
 }
 
-// Convert a JSON Schema property to a Zod type. The SDK's createSdkMcpServer
-// runs zodToJsonSchema on the inputSchema for tools/list — plain JSON Schema
-// objects get silently replaced with an empty schema.
-import { z } from "zod";
+// --- TypeBox → Zod schema conversion ---
+//
+// Pi tools use TypeBox (JSON Schema objects). The SDK's MCP server needs Zod.
+//
+// Why: createSdkMcpServer's tools/list handler calls zodToJsonSchema() on each
+// tool's inputSchema. It detects Zod via the `~standard` marker or `_def`/`_zod`
+// properties (see `Z0()` in sdk.mjs). Plain JSON Schema objects silently fall
+// back to `{type: "object", properties: {}}` — the model sees no params.
+//
+// If this breaks after an SDK update, check whether `Z0()` detection changed
+// or whether createSdkMcpServer now accepts raw JSON Schema.
 
 function jsonSchemaPropertyToZod(prop: Record<string, unknown>): z.ZodTypeAny {
 	let base: z.ZodTypeAny;
@@ -577,6 +585,8 @@ function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeAny> {
 	return shape;
 }
 
+/** Creates an MCP server that bridges pi tools to the SDK. Each tool handler
+ *  blocks on a Promise until pi delivers the tool result via streamSimple. */
 function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!tools.length) return undefined;
 	const mcpTools = tools.map((tool) => ({
@@ -663,6 +673,8 @@ function finalizeCurrentStream(stopReason?: string): void {
 	currentPiStream = null;
 }
 
+/** Maps Anthropic stream events to pi stream events (text, thinking, toolcall).
+ *  On message_stop with tool_use: ends currentPiStream so pi can execute the tool. */
 function processStreamEvent(
 	message: SDKMessage,
 	customToolNameToPi: Map<string, string>,
@@ -784,6 +796,8 @@ function processStreamEvent(
 	}
 }
 
+/** Fallback for when stream_event messages are absent (e.g. post-tool continuations).
+ *  Extracts text from the complete assistant message and synthesizes pi events. */
 function processAssistantMessage(message: SDKMessage, model: Model<any>): void {
 	if (turnSawStreamEvent) return; // stream events already handled this turn
 	const assistantMsg = (message as any).message;
@@ -812,6 +826,9 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>): void {
 	}
 }
 
+/** Background consumer: iterates the SDK generator, pushing events to currentPiStream.
+ *  Runs until the query ends. On tool_use, processStreamEvent ends the stream and
+ *  the MCP handler blocks the generator until the next streamSimple call resolves it. */
 async function consumeQuery(
 	sdkQuery: ReturnType<typeof query>,
 	customToolNameToPi: Map<string, string>,
@@ -848,6 +865,8 @@ async function consumeQuery(
 	return { capturedSessionId };
 }
 
+/** Provider entry point. Pi calls this for each new prompt and each tool result.
+ *  Three cases: fresh query, tool result delivery, deferred tool result (race). */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
