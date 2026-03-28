@@ -112,6 +112,8 @@ function errorMessage(err: unknown): string {
 
 // --- Text extraction ---
 
+// Text-only extraction — images and unknown block types are lost.
+// Callers: extractUserPrompt, extractLastToolResult, convertAndImportMessages (tool results).
 function messageContentToText(
 	content: string | Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
 ): string {
@@ -216,7 +218,11 @@ function sessionLog(msg: string) {
 	} catch {}
 }
 
-/** Convert pi messages to Anthropic API format and import into a cc-session-io session. */
+// Convert pi messages to Anthropic API format for session import.
+// Lossy: non-Anthropic thinking blocks are dropped (no valid signature), and only
+// text/image/toolCall block types are handled. If all blocks in an assistant message
+// are filtered, the message is dropped — which can create invalid sequences (e.g.
+// two user messages in a row, or tool_result without preceding tool_use).
 function convertAndImportMessages(
 	session: ReturnType<typeof createSession>,
 	messages: Context["messages"],
@@ -280,7 +286,8 @@ function convertAndImportMessages(
 	if (anthropicMessages.length) session.importMessages(anthropicMessages as any);
 }
 
-/** Extract the text content from the last tool result message. */
+// Extract text from the last tool result. Goes through messageContentToText,
+// so images in tool results (e.g. screenshots) are lost.
 function extractLastToolResult(context: Context): { content: string; isError: boolean } | null {
 	for (let i = context.messages.length - 1; i >= 0; i--) {
 		const msg = context.messages[i];
@@ -331,8 +338,6 @@ function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockPar
 				type: "image",
 				source: { type: "base64", media_type: block.mimeType as Base64ImageSource["media_type"], data: block.data },
 			});
-		} else if (block.type !== "text") {
-			debug("extractUserPromptBlocks: dropping block type", block.type);
 		}
 	}
 	return hasImage ? blocks : null;
@@ -448,6 +453,8 @@ function rewriteSkillAliasPath(pathValue: unknown): unknown {
 	return pathValue;
 }
 
+// Maps SDK tool args to pi tool args. Only known keys are forwarded per tool —
+// new SDK parameters will be silently dropped until the mapping is updated.
 function mapToolArgs(
 	toolName: string, args: Record<string, unknown> | undefined, allowSkillAliasRewrite = true,
 ): Record<string, unknown> {
@@ -572,7 +579,8 @@ interface PendingToolCall {
 	resolve: (result: string) => void;
 }
 
-// Module-level state for the push-based streaming pattern
+// Module-level state for the push-based streaming pattern.
+// Assumes pi calls streamSimple sequentially — concurrent calls will clobber state.
 let activeQuery: ReturnType<typeof query> | null = null;
 let pendingToolCall: PendingToolCall | null = null;
 let toolCallDetected: (() => void) | null = null;
@@ -651,8 +659,11 @@ function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeAny> {
 	return shape;
 }
 
-/** Creates an MCP server that bridges pi tools to the SDK. Each tool handler
- *  blocks on a Promise until pi delivers the tool result via streamSimple. */
+// Creates an MCP server that bridges pi tools to the SDK. Each tool handler
+// blocks on a Promise until pi delivers the tool result via streamSimple.
+// Lossy: tool results are flattened to text — images/structured data in results are lost.
+// Risk: if pi never calls back (abort, crash), the promise hangs and the SDK generator
+// is stuck. sdkQuery.interrupt() breaks the generator loop but the promise is never rejected.
 function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!tools.length) return undefined;
 	const mcpTools = tools.map((tool) => ({
@@ -847,7 +858,8 @@ function processStreamEvent(
 		currentPiStream.end();
 		currentPiStream = null;
 
-		if (sharedSession) sharedSession.cursor += turnBlocks.length;
+		// Cursor is updated by the next streamSimple call (Case A/B) which sets
+		// cursor = context.messages.length with the actual post-tool-result context.
 		return;
 	}
 
@@ -856,8 +868,8 @@ function processStreamEvent(
 	}
 }
 
-/** Fallback for when stream_event messages are absent (e.g. post-tool continuations).
- *  Extracts text from the complete assistant message and synthesizes pi events. */
+// Fallback for when stream_event messages are absent (e.g. post-tool continuations).
+// Only handles text blocks — thinking and tool_use blocks are lost in this path.
 function processAssistantMessage(message: SDKMessage, model: Model<any>): void {
 	if (turnSawStreamEvent) return; // stream events already handled this turn
 	const assistantMsg = (message as any).message;
@@ -1014,11 +1026,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Background consumer — runs until query ends
 	consumeQuery(sdkQuery, customToolNameToPi, allowSkillAliasRewrite, model, () => wasAborted)
 		.then(({ capturedSessionId }) => {
-			// Update session state
+			// Update session state. Use Math.max to avoid regressing cursor: in multi-tool
+			// queries, Case A/B set cursor to the latest context.messages.length, but the
+			// `context` closure here is from the initial streamSimple call (stale).
 			if (!wasAborted) {
 				const sessionId = capturedSessionId ?? sharedSession?.sessionId;
 				if (sessionId) {
-					sharedSession = { sessionId, cursor: context.messages.length, cwd };
+					const cursor = Math.max(context.messages.length, sharedSession?.cursor ?? 0);
+					sharedSession = { sessionId, cursor, cwd };
 				}
 			}
 
@@ -1073,7 +1088,9 @@ async function promptAndWait(
 	const modelId = resolveModelId(options?.model ?? "opus");
 
 	// Session resume for shared mode — reuse provider's session if it exists,
-	// otherwise create one from pi's context
+	// otherwise create one from pi's context.
+	// Note: doesn't update sharedSession.cursor after completion, so the next
+	// provider call will see missed messages and trigger a Case 4 rebuild.
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
 		if (sharedSession) {
