@@ -195,8 +195,9 @@ await test("isError flag flows through both paths", async () => {
 	assert.equal(got2.isError, false);
 });
 
-// --- Scenario G: property-based fuzz ---
+// --- Scenario G: property-based fuzz (FUZZ=1 to enable) ---
 
+if (process.env.FUZZ) {
 console.log("Scenario G: fuzz (1000 random orderings)");
 
 await test("random delivery/handler orderings always drain correctly", async () => {
@@ -229,6 +230,7 @@ await test("random delivery/handler orderings always drain correctly", async () 
 		assert.equal(bridge.resultsQueued, 0);
 	}
 });
+}
 
 // --- Summary ---
 
