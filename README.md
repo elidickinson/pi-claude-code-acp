@@ -2,6 +2,8 @@
 
 Pi extension that integrates Claude Code via the [Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript). Provides two ways to use Claude Code from pi:
 
+> Built on [claude-agent-sdk-pi](https://github.com/prateekmedia/claude-agent-sdk-pi) by Prateek Sunal — the provider skeleton, tool name mapping, and settings loading originate from that project. This fork adds streaming, MCP tool bridging, context sync with pi, thinking support, and the AskClaude tool.
+
 1. **Provider** — Offers Opus/Sonnet/Haiku as models that can be selected in pi like usual
 2. **AskClaude tool** — Pi can use this to delegate tasks or ask questions of Claude Code without switching from another model/provider
 
@@ -94,6 +96,10 @@ Config files: `~/.pi/agent/claude-bridge.json` (global) and `.pi/claude-bridge.j
 ## Limitations
 
 **Claude Code loads its own skills** from `~/.claude/skills/` and `.claude/skills/` in addition to the pi skills we forward. These are additive — Claude Code may have skills pi doesn't know about.
+
+## Debugging
+
+Set `CLAUDE_BRIDGE_DEBUG=1` to enable debug logging to `~/.pi/agent/claude-bridge.log`.
 
 ## Architecture
 

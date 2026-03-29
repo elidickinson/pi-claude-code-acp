@@ -12,6 +12,13 @@
   ],
   "author": "Eli Dickinson",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elidickinson/pi-claude-bridge.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "files": [
     "index.ts",
     "README.md",
@@ -29,8 +36,8 @@
     "change-case": "^5.4.4"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "^0.52.0",
-    "@mariozechner/pi-coding-agent": "^0.52.0"
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@mariozechner/pi-ai": "^0.52.0",
