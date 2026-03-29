@@ -1,5 +1,5 @@
 import { calculateCost, createAssistantMessageEventStream, getModels, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
-import { buildSessionContext, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { buildSessionContext, keyHint, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import { z } from "zod";
@@ -172,6 +172,9 @@ function buildActionSummary(calls: Map<string, ToolCallState>): string {
 			if (path) edits.add(shortPath(path));
 		} else if (verb === "bash" || verb === "terminal") {
 			commands.push(path ?? "command");
+		} else if (verb === "agent") {
+			const input = tc.rawInput as Record<string, unknown> | undefined;
+			other.push(`Agent(${String(input?.description ?? "").slice(0, 40)})`);
 		} else {
 			other.push(tc.name);
 		}
@@ -1391,7 +1394,8 @@ export default function (pi: ExtensionAPI) {
 					const truncated = body.length > PREVIEW_MAX_CHARS ? body.substring(0, PREVIEW_MAX_CHARS) : body;
 					const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
 					if (lines.length) text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
-					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", "…")}`;
+					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", `… (${keyHint("app.tools.expand", "to expand")})`)}`;
+
 				}
 
 				return new Text(text, 0, 0);
