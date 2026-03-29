@@ -591,7 +591,7 @@ interface PendingToolCall {
 // Module-level state for the push-based streaming pattern.
 // Assumes pi calls streamSimple sequentially — concurrent calls will clobber state.
 let activeQuery: ReturnType<typeof query> | null = null;
-let pendingToolCall: PendingToolCall | null = null;
+let pendingToolCalls: PendingToolCall[] = [];
 let toolCallDetected: (() => void) | null = null;
 let currentPiStream: ReturnType<typeof createAssistantMessageEventStream> | null = null;
 
@@ -679,13 +679,15 @@ function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof create
 		handler: async () => {
 			debug(`mcp handler invoked: ${tool.name}`);
 			return new Promise<{ content: McpContent; isError?: boolean }>((resolve) => {
-				pendingToolCall = {
+				pendingToolCalls.push({
 					toolName: tool.name,
 					resolve: (content: McpContent) => resolve({ content }),
-				};
-				// Signal that the MCP handler has set pendingToolCall
-				toolCallDetected?.();
-				toolCallDetected = null;
+				});
+				// Signal that the MCP handler has set its first pending entry
+				if (pendingToolCalls.length === 1) {
+					toolCallDetected?.();
+					toolCallDetected = null;
+				}
 			});
 		},
 	}));
@@ -736,6 +738,11 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 //    blocks the generator naturally — no events arrive until resolved.
 // 4. Pi executes the tool, calls streamSimple again. We swap in the new stream,
 //    resolve the MCP handler, and the generator unblocks — events flow to new stream.
+//
+// Note: resetTurnState clears turnSawStreamEvent while the generator may still
+// have queued messages from the previous turn. This is safe because step 3 nulls
+// currentPiStream, so any leftover messages hit the `!currentPiStream` guard in
+// consumeQuery and are skipped before resetTurnState runs.
 
 function resetTurnState(model: Model<any>): void {
 	turnOutput = {
@@ -856,9 +863,10 @@ function processStreamEvent(
 	}
 
 	if (event?.type === "message_stop" && turnSawToolCall) {
-		// Tool call complete — end this pi stream. The MCP handler is already
-		// blocking the generator, so no new events arrive until pi calls
-		// streamSimple again and resolves the tool call.
+		// Tool call complete — end this pi stream. The SDK will still yield an
+		// assistant message for this turn, but currentPiStream=null causes
+		// consumeQuery to skip it. The MCP handler blocks the generator until
+		// pi delivers the tool result via the next streamSimple call.
 		turnOutput.stopReason = "toolUse";
 		currentPiStream.push({ type: "done", reason: "toolUse", message: turnOutput });
 		currentPiStream.end();
@@ -874,10 +882,14 @@ function processStreamEvent(
 	}
 }
 
-// Fallback for when stream_event messages are absent (e.g. post-tool continuations).
-// Synthesizes pi stream events from the complete assistant message.
+// The SDK always yields `assistant` messages (completed content blocks) after streaming.
+// When stream_events already delivered the content, this is a no-op. But after
+// resetTurnState (e.g. tool result delivery), if the next turn's assistant message
+// arrives before any stream_events, this is the primary content path. Must maintain
+// the same stream lifecycle as processStreamEvent — including ending the stream on
+// tool_use to prevent deadlock with the MCP handler.
 function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>, allowSkillAliasRewrite: boolean): void {
-	if (turnSawStreamEvent) return; // stream events already handled this turn
+	if (turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
@@ -915,9 +927,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	}
 	if (assistantMsg.usage && turnOutput) updateUsage(turnOutput, assistantMsg.usage, model);
 
-	// Mirror processStreamEvent's message_stop handler: end the stream so pi
-	// knows to deliver the tool result. Without this, the MCP handler blocks
-	// the generator while pi waits for the stream to end → deadlock.
+	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
 	if (turnSawToolCall && currentPiStream && turnOutput) {
 		turnOutput.stopReason = "toolUse";
 		currentPiStream.push({ type: "done", reason: "toolUse", message: turnOutput });
@@ -927,8 +937,10 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 }
 
 /** Background consumer: iterates the SDK generator, pushing events to currentPiStream.
- *  Runs until the query ends. On tool_use, processStreamEvent ends the stream and
- *  the MCP handler blocks the generator until the next streamSimple call resolves it. */
+ *  Runs until the query ends. Per turn, the SDK yields stream_events (deltas), then
+ *  an assistant message (completed blocks). On tool_use, the stream is ended by
+ *  whichever path handles it first (processStreamEvent or processAssistantMessage),
+ *  and the MCP handler blocks the generator until pi delivers the tool result. */
 async function consumeQuery(
 	sdkQuery: ReturnType<typeof query>,
 	customToolNameToPi: Map<string, string>,
@@ -974,28 +986,28 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const stream = createAssistantMessageEventStream();
 
 	// --- Tool result turn: swap stream, resolve tool, generator unblocks ---
-	if (activeQuery && pendingToolCall) {
+	if (activeQuery && pendingToolCalls.length > 0) {
 		currentPiStream = stream;
 		resetTurnState(model);
 		const toolResult = extractLastToolResult(context);
 		const mcpContent = toolResult?.content ?? [{ type: "text" as const, text: "OK" }];
-		debug(`provider: tool result, resolving ${pendingToolCall.toolName}, blocks=${mcpContent.length}`);
-		pendingToolCall.resolve(mcpContent);
-		pendingToolCall = null;
+		const pending = pendingToolCalls.shift()!;
+		debug(`provider: tool result, resolving ${pending.toolName}, blocks=${mcpContent.length}`);
+		pending.resolve(mcpContent);
 		if (sharedSession) sharedSession.cursor = context.messages.length;
 		return stream;
 	}
 
 	// --- MCP handler not yet called — wait for it ---
-	if (activeQuery && !pendingToolCall) {
+	if (activeQuery && pendingToolCalls.length === 0) {
 		currentPiStream = stream;
 		resetTurnState(model);
 		toolCallDetected = () => {
 			const toolResult = extractLastToolResult(context);
 			const mcpContent = toolResult?.content ?? [{ type: "text" as const, text: "OK" }];
-			debug(`provider: deferred tool result, resolving ${pendingToolCall!.toolName}, blocks=${mcpContent.length}`);
-			pendingToolCall!.resolve(mcpContent);
-			pendingToolCall = null;
+			const pending = pendingToolCalls.shift()!;
+			debug(`provider: deferred tool result, resolving ${pending.toolName}, blocks=${mcpContent.length}`);
+			pending.resolve(mcpContent);
 			if (sharedSession) sharedSession.cursor = context.messages.length;
 		};
 		return stream;
@@ -1063,7 +1075,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const onAbort = () => {
 		wasAborted = true;
 		// Resolve any pending MCP handler so the promise doesn't hang
-		if (pendingToolCall) { pendingToolCall.resolve([{ type: "text", text: "Operation aborted" }]); pendingToolCall = null; }
+		for (const pending of pendingToolCalls) { pending.resolve([{ type: "text", text: "Operation aborted" }]); } pendingToolCalls.length = 0;
 		requestAbort();
 	};
 	if (options?.signal) {
