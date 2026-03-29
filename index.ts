@@ -6,8 +6,8 @@ import { z } from "zod";
 import { pascalCase } from "change-case";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
-import { createSession, openSession } from "cc-session-io";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
+import { createSession } from "cc-session-io";
+import { appendFileSync, existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, relative, resolve } from "path";
 
@@ -92,9 +92,11 @@ function loadConfig(cwd: string): Config {
 	const projectPath = join(cwd, ".pi", "claude-bridge.json");
 	let global: Partial<Config> = {};
 	let project: Partial<Config> = {};
-	if (existsSync(globalPath)) { try { global = JSON.parse(readFileSync(globalPath, "utf-8")); } catch {} }
-	if (existsSync(projectPath)) { try { project = JSON.parse(readFileSync(projectPath, "utf-8")); } catch {} }
-	return { askClaude: { ...global.askClaude, ...project.askClaude } };
+	if (existsSync(globalPath)) { try { global = JSON.parse(readFileSync(globalPath, "utf-8")); } catch (e) { console.error(`claude-bridge: failed to parse ${globalPath}: ${e}`); } }
+	if (existsSync(projectPath)) { try { project = JSON.parse(readFileSync(projectPath, "utf-8")); } catch (e) { console.error(`claude-bridge: failed to parse ${projectPath}: ${e}`); } }
+	const merged = { askClaude: { ...global.askClaude, ...project.askClaude } };
+	debug("loadConfig:", JSON.stringify(merged));
+	return merged;
 }
 
 // --- Error handling ---
@@ -209,13 +211,6 @@ interface SessionState {
 let sharedSession: SessionState | null = null;
 
 const MAX_MIRROR_MESSAGES = 40;
-const SESSION_LOG = join(homedir(), ".pi", "agent", "claude-bridge-session.log");
-function sessionLog(msg: string) {
-	try {
-		mkdirSync(dirname(SESSION_LOG), { recursive: true });
-		appendFileSync(SESSION_LOG, `[${new Date().toISOString()}] ${msg}\n`);
-	} catch {}
-}
 
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: non-Anthropic thinking blocks are dropped (no valid signature), and only
@@ -230,6 +225,7 @@ function convertAndImportMessages(
 	const capped = messages.length > MAX_MIRROR_MESSAGES
 		? messages.slice(-MAX_MIRROR_MESSAGES)
 		: messages;
+	if (messages.length > MAX_MIRROR_MESSAGES) debug(`convertAndImportMessages: capped ${messages.length} → ${MAX_MIRROR_MESSAGES} messages`);
 	const anthropicMessages: Array<{ role: string; content: unknown }> = [];
 
 	for (const msg of capped) {
@@ -263,7 +259,7 @@ function convertAndImportMessages(
 					if (isAnthropicProvider && sig) {
 						blocks.push({ type: "thinking", thinking: block.thinking ?? "", signature: sig });
 					} else {
-						debug("convertAndImportMessages: dropping thinking block (non-Anthropic or no signature)");
+						debug("convertAndImportMessages: dropping thinking block — provider:", (msg as any).provider, "api:", (msg as any).api, "hasSig:", Boolean(sig));
 					}
 				} else if (block.type === "toolCall") {
 					const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
@@ -326,23 +322,23 @@ function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockPar
 	const last = messages[messages.length - 1];
 	if (!last || last.role !== "user") return null;
 	if (typeof last.content === "string") {
-		sessionLog(`extractUserPromptBlocks: content is string (length=${last.content.length})`);
+		debug(`extractUserPromptBlocks: content is string (length=${last.content.length})`);
 		return null;
 	}
 	if (!Array.isArray(last.content)) {
-		sessionLog(`extractUserPromptBlocks: content is ${typeof last.content}`);
+		debug(`extractUserPromptBlocks: content is ${typeof last.content}`);
 		return null;
 	}
-	sessionLog(`extractUserPromptBlocks: ${last.content.length} blocks, types=${last.content.map((b: any) => b.type).join(",")}`);
+	debug(`extractUserPromptBlocks: ${last.content.length} blocks, types=${last.content.map((b: any) => b.type).join(",")}`);
 	let hasImage = false;
 	const blocks: ContentBlockParam[] = [];
 	for (const block of last.content) {
 		if (block.type === "text" && block.text) {
 			blocks.push({ type: "text", text: block.text });
 		} else if (block.type === "image") {
-			sessionLog(`image block: mimeType=${(block as any).mimeType}, data length=${((block as any).data ?? "").length}, keys=${Object.keys(block).join(",")}`);
+			debug(`image block: mimeType=${(block as any).mimeType}, data length=${((block as any).data ?? "").length}, keys=${Object.keys(block).join(",")}`);
 			if (!(block as any).data || !(block as any).mimeType) {
-				sessionLog(`image block missing data or mimeType, skipping`);
+				debug(`image block missing data or mimeType, skipping`);
 				continue;
 			}
 			hasImage = true;
@@ -382,20 +378,20 @@ function syncSharedSession(
 
 	if (!sharedSession) {
 		if (priorMessages.length === 0) {
-			sessionLog(`Case 1: clean start, ${messages.length} total messages`);
+			debug(`Case 1: clean start, ${messages.length} total messages`);
 			return { sessionId: null };
 		}
 		const session = createSession({ projectPath: cwd, ...(modelId ? { model: modelId } : {}) });
 		convertAndImportMessages(session, priorMessages, customToolNameToSdk);
 		session.save();
 		sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
-		sessionLog(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
+		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
 		return { sessionId: session.sessionId };
 	}
 
 	const missed = priorMessages.slice(sharedSession.cursor);
 	if (missed.length === 0) {
-		sessionLog(`Case 3: no missed messages, resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+		debug(`Case 3: no missed messages, resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 		return { sessionId: sharedSession.sessionId };
 	}
 
@@ -406,7 +402,7 @@ function syncSharedSession(
 	session.save();
 	const oldSessionId = sharedSession.sessionId;
 	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd: sharedSession.cwd };
-	sessionLog(`Case 4: ${missed.length} missed messages, ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${oldSessionId.slice(0, 8)}), ${session.messages.length} records`);
+	debug(`Case 4: ${missed.length} missed messages, ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${oldSessionId.slice(0, 8)}), ${session.messages.length} records`);
 	return { sessionId: session.sessionId };
 }
 
@@ -577,7 +573,8 @@ function readSettingsFile(filePath: string): ProviderSettings {
 		const strictMcpConfig =
 			typeof settingsBlock["strictMcpConfig"] === "boolean" ? settingsBlock["strictMcpConfig"] : undefined;
 		return { appendSystemPrompt, settingSources, strictMcpConfig };
-	} catch {
+	} catch (e) {
+		console.error(`claude-bridge: failed to parse ${filePath}: ${e}`);
 		return {};
 	}
 }
@@ -680,7 +677,7 @@ function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof create
 		description: tool.description,
 		inputSchema: jsonSchemaToZodShape(tool.parameters),
 		handler: async () => {
-			// Block until pi provides the tool result via the next streamSimple call
+			debug(`mcp handler invoked: ${tool.name}`);
 			return new Promise<{ content: McpContent; isError?: boolean }>((resolve) => {
 				pendingToolCall = {
 					toolName: tool.name,
@@ -883,7 +880,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	if (turnSawStreamEvent) return; // stream events already handled this turn
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
-	sessionLog(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
+	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
 		if (block.type === "text" && block.text) {
 			ensureTurnStarted();
@@ -917,6 +914,16 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		}
 	}
 	if (assistantMsg.usage && turnOutput) updateUsage(turnOutput, assistantMsg.usage, model);
+
+	// Mirror processStreamEvent's message_stop handler: end the stream so pi
+	// knows to deliver the tool result. Without this, the MCP handler blocks
+	// the generator while pi waits for the stream to end → deadlock.
+	if (turnSawToolCall && currentPiStream && turnOutput) {
+		turnOutput.stopReason = "toolUse";
+		currentPiStream.push({ type: "done", reason: "toolUse", message: turnOutput });
+		currentPiStream.end();
+		currentPiStream = null;
+	}
 }
 
 /** Background consumer: iterates the SDK generator, pushing events to currentPiStream.
@@ -972,7 +979,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		resetTurnState(model);
 		const toolResult = extractLastToolResult(context);
 		const mcpContent = toolResult?.content ?? [{ type: "text" as const, text: "OK" }];
-		sessionLog(`provider: tool result, resolving ${pendingToolCall.toolName}, blocks=${mcpContent.length}`);
+		debug(`provider: tool result, resolving ${pendingToolCall.toolName}, blocks=${mcpContent.length}`);
 		pendingToolCall.resolve(mcpContent);
 		pendingToolCall = null;
 		if (sharedSession) sharedSession.cursor = context.messages.length;
@@ -986,7 +993,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		toolCallDetected = () => {
 			const toolResult = extractLastToolResult(context);
 			const mcpContent = toolResult?.content ?? [{ type: "text" as const, text: "OK" }];
-			sessionLog(`provider: deferred tool result, resolving ${pendingToolCall!.toolName}, blocks=${mcpContent.length}`);
+			debug(`provider: deferred tool result, resolving ${pendingToolCall!.toolName}, blocks=${mcpContent.length}`);
 			pendingToolCall!.resolve(mcpContent);
 			pendingToolCall = null;
 			if (sharedSession) sharedSession.cursor = context.messages.length;
@@ -1006,8 +1013,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const prompt: string | AsyncIterable<SDKUserMessage> = promptBlocks
 		? wrapPromptStream(promptBlocks)
 		: promptText;
-	sessionLog(`provider: fresh query, ${context.messages.length} msgs, resume=${resumeSessionId?.slice(0, 8) ?? "none"}, prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
-
 	const mcpServers = buildMcpServers(mcpTools);
 	const providerSettings = loadProviderSettings();
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
@@ -1044,6 +1049,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
 	};
 
+	debug("provider: fresh query",
+		`model=${model.id} msgs=${context.messages.length} tools=${mcpTools.length}`,
+		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
+		`appendSys=${appendSystemPrompt} strictMcp=${strictMcpConfigEnabled}`,
+		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
+
 	let wasAborted = false;
 	const sdkQuery = query({ prompt, options: queryOptions });
 	activeQuery = sdkQuery;
@@ -1070,6 +1081,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				const sessionId = capturedSessionId ?? sharedSession?.sessionId;
 				if (sessionId) {
 					const cursor = Math.max(context.messages.length, sharedSession?.cursor ?? 0);
+					debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
 					sharedSession = { sessionId, cursor, cwd };
 				}
 			}
@@ -1087,6 +1099,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 		})
 		.catch((error) => {
+			debug(`provider: query error, model=${model.id}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			if (turnOutput) {
 				turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
 				turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
@@ -1134,16 +1147,12 @@ async function promptAndWait(
 			// Provider already has a session — just resume from it
 			// Any missed messages from other providers were already handled by the provider's Case 4
 			resumeSessionId = sharedSession.sessionId;
-			sessionLog(`askClaude shared: reusing provider session ${sharedSession.sessionId.slice(0, 8)}, prompt=${prompt.slice(0, 60)}`);
 		} else {
 			// No provider session yet — create one from pi's context
 			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
 			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId);
 			resumeSessionId = sync.sessionId;
-			sessionLog(`askClaude shared: created session ${resumeSessionId?.slice(0, 8) ?? "none"}, ${options.context.length} context msgs, prompt=${prompt.slice(0, 60)}`);
 		}
-	} else {
-		sessionLog(`askClaude ${options?.isolated ? "isolated" : "no-context"}: prompt=${prompt.slice(0, 60)}`);
 	}
 
 	// Mode → disallowed tools
@@ -1161,6 +1170,11 @@ async function promptAndWait(
 		"strict-mcp-config": null,
 		model: modelId,
 	};
+
+	debug("askClaude:",
+		`mode=${mode} model=${modelId} effort=${effort ?? "default"}`,
+		`isolated=${options?.isolated ?? false} resume=${resumeSessionId?.slice(0, 8) ?? "none"}`,
+		`skills=${Boolean(skillsBlock)} prompt=${prompt.slice(0, 60)}`);
 
 	const sdkQuery = query({
 		prompt,
@@ -1254,9 +1268,13 @@ export default function (pi: ExtensionAPI) {
 	const config = loadConfig(process.cwd());
 
 	// Reset shared session on pi session lifecycle events
-	pi.on("session_switch", () => { sharedSession = null; });
-	pi.on("session_fork", () => { sharedSession = null; });
-	pi.on("session_shutdown", () => { sharedSession = null; });
+	const clearSession = (event: string) => {
+		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
+		sharedSession = null;
+	};
+	pi.on("session_switch", () => clearSession("session_switch"));
+	pi.on("session_fork", () => clearSession("session_fork"));
+	pi.on("session_shutdown", () => clearSession("session_shutdown"));
 
 	// --- Provider ---
 
@@ -1380,6 +1398,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				} catch (err) {
 					clearInterval(progressInterval);
+					debug(`askClaude error: mode=${mode}, model=${params.model ?? "default"}, isolated=${params.isolated ?? false}, error=`, err);
 					console.error("[claude-bridge] AskClaude error:", err);
 					const msg = errorMessage(err);
 					return {
