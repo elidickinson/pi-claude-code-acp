@@ -5,12 +5,12 @@ Pi extension that integrates Claude Code via the [Agent SDK](https://github.com/
 > Built on [claude-agent-sdk-pi](https://github.com/prateekmedia/claude-agent-sdk-pi) by Prateek Sunal — the provider skeleton, tool name mapping, and settings loading originate from that project. This fork adds streaming, MCP tool bridging, context sync with pi, thinking support, and the AskClaude tool.
 
 1. **Provider** — Use Opus/Sonnet/Haiku as models in pi, with all tool calls flowing through pi's TUI
-2. **AskClaude tool** — Delegate to Claude Code for a second opinion without switching providers
+2. **AskClaude tool** — Delegate to Claude Code for a second opinion or to perform some task without switching providers
 
 Uses your Claude Max/Pro subscription. Only the real Claude Code touches Anthropic's API so as best I can tell using this with pi complies with Anthropic terms. Obviously this extension is not endorsed or supported by Anthropic.
 
-<a href="claude-bridge1.png"><img src="claude-bridge1.png" width="600"></a>
-<a href="claude-bridge2.png"><img src="claude-bridge2.png" width="600"></a>
+<a href="claude-bridge1.png"><img src="claude-bridge1.png" width="400"></a>
+<a href="claude-bridge2.png"><img src="claude-bridge2.png" width="400"></a>
 
 ## Setup
 
