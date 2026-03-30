@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "description": "Pi extension that uses Claude Code (via Agent SDK) as a model provider and adds an AskClaude tool.",
   "keywords": [

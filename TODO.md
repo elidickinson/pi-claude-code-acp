@@ -16,6 +16,22 @@
   tools may have similar mismatches (units, defaults, optional-vs-required params).
   Compare Claude Code's tool schemas against pi's for read, write, edit, grep, find.
 
+## Possible Enhancements
+
+- **AskUserQuestion pi shim** (main provider only): CC never sees
+  AskUserQuestion (it's in `DISALLOWED_BUILTIN_TOOLS`), so it can't ask the
+  user questions interactively. Port a pi-native version using `ctx.ui.custom()`
+  for an option picker with free-text fallback. Not applicable to AskClaude
+  subagents (can't interact with user). See `fractary/pi-claude-code`
+  `AskUserQuestion.ts` for reference.
+
+- **PlanMode pi shim** (main provider only): Similarly, EnterPlanMode/
+  ExitPlanMode are blocked. A pi-native plan mode could use
+  `pi.setActiveTools()` to restrict to read-only tools, block destructive bash
+  via `tool_call` event, and surface plan approval through pi's TUI. Not
+  applicable to AskClaude subagents. See `fractary/pi-claude-code`
+  `PlanMode.ts`.
+
 ## Deferred
 
 - **Session JSONL cleanup**: Track session IDs created during a pi session. On

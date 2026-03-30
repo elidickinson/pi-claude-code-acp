@@ -201,14 +201,21 @@ function buildActionSummary(calls: Map<string, ToolCallState>): string {
 	return parts.join("; ");
 }
 
-// AskClaude mode presets — controls which CC tools are blocked per mode
+// AskClaude mode presets — controls which CC tools are blocked per mode.
+// AskUserQuestion and plan tools are always blocked: subagents can't interact with the user.
+const ASKCLAUDE_ALWAYS_BLOCKED = [
+	"AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+	"ToolSearch", // probes for blocked tools, wastes tokens
+];
 const MODE_DISALLOWED_TOOLS: Record<string, string[]> = {
-	full: [],
+	full: [...ASKCLAUDE_ALWAYS_BLOCKED],
 	read: [
+		...ASKCLAUDE_ALWAYS_BLOCKED,
 		"Write", "Edit", "Bash", "NotebookEdit",
 		"EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete", "TeamCreate", "TeamDelete",
 	],
 	none: [
+		...ASKCLAUDE_ALWAYS_BLOCKED,
 		"Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent",
 		"NotebookEdit", "EnterWorktree", "ExitWorktree",
 		"CronCreate", "CronDelete", "TeamCreate", "TeamDelete",
