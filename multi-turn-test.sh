@@ -65,7 +65,8 @@ run_json "multi-turn: tool use, context, history" \
   '([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "toolcall_end")] | length) >= 2 and
    ([.[] | select(.type == "agent_end")] | length) >= 3 and
    ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("'"$EXPECTED_VERSION"'")) and
-   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("banana"))' \
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("banana")) and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("experimental"; "i"))' \
   pi --no-session -ne -e "$DIR" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \
@@ -78,11 +79,12 @@ run_json "multi-turn: tool use, context, history" \
 run_json "single-turn: multiple sequential tool calls" \
   '([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "toolcall_end")] | length) >= 2 and
    ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("pi-claude-bridge")) and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("experimental"; "i")) and
    ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end")] | length) > 0' \
   pi --no-session -ne -e "$DIR" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \
-  -p "Read both package.json and README.md, then tell me the package name and the first word of the README heading."
+  -p "Read both package.json and README.md, then tell me the package name and the full first heading of the README."
 
 # 3+ parallel tool calls in a single turn — exercises the chained MCP resolve
 # fix that ensures all pending tool results are delivered when the model fires
@@ -90,7 +92,10 @@ run_json "single-turn: multiple sequential tool calls" \
 run_json "single-turn: 3+ parallel tool calls" \
   '([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "toolcall_end")] | length) >= 3 and
    ([ .[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") ] | length) > 0 and
-   ([ .[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content | select(. != null and . != "") ] | length) > 0' \
+   ([ .[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content | select(. != null and . != "") ] | length) > 0 and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("pi-claude-bridge")) and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("ES2022")) and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("experimental"; "i"))' \
   pi --no-session -ne -e "$DIR" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \
@@ -107,6 +112,20 @@ run_json "regression: final text survives multi-round tool calls" \
   --model "claude-bridge/claude-haiku-4-5" \
   --mode json \
   -p "Read package.json and README.md, then summarize what you found in one sentence."
+
+# Regression: extractAllToolResults traversed past assistant messages, feeding
+# stale tool results from turn 1 into turn 2.  Turn 1 reads package.json (has
+# "pi-claude-bridge"), turn 2 reads LICENSE (has "MIT License").  If stale
+# results leak, turn 2 would see package.json content instead of LICENSE content.
+run_json "regression: turn 2 tool results not stale from turn 1" \
+  '([.[] | select(.type == "agent_end")] | length) >= 2 and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "toolcall_end")] | length) >= 2 and
+   ([.[] | select(.type == "message_update") | .assistantMessageEvent | select(.type == "text_end") | .content] | join(" ") | test("[Mm][Ii][Tt]"))' \
+  pi --no-session -ne -e "$DIR" \
+  --model "claude-bridge/claude-haiku-4-5" \
+  --mode json \
+  -p "Read package.json and tell me the package name. Be brief, just the name." \
+     "Now read LICENSE and tell me what type of license it is. Be brief, just the license type."
 
 # --- Summary ---
 

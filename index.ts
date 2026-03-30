@@ -44,6 +44,7 @@ const DISALLOWED_BUILTIN_TOOLS = [
 	"WebFetch", "WebSearch", "TodoRead", "TodoWrite",
 	"EnterPlanMode", "ExitPlanMode", "RemoteTrigger", "SendMessage",
 	"Skill", "TaskOutput", "TaskStop", "ToolSearch",
+	"AskUserQuestion", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",
 ];
 
 const LATEST_MODEL_IDS = new Set(["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]);
@@ -325,8 +326,8 @@ function msgPreview(msg: { role: string; content?: unknown }): string {
 	return `${msg.role}:${JSON.stringify(typeof text === "string" ? text.slice(0, 60) : text)}`;
 }
 
-// Extract all tool results from the end of context (before the last user message).
-// Order matches the assistant's tool_use blocks since pi preserves ordering.
+// Extract tool results for the current turn from the end of context.
+// Stops at the nearest assistant or user message — only collects results from THIS turn.
 function extractAllToolResults(context: Context): McpResult[] {
 	const results: McpResult[] = [];
 	let stopIdx = -1;
@@ -334,9 +335,9 @@ function extractAllToolResults(context: Context): McpResult[] {
 		const msg = context.messages[i];
 		if (msg.role === "toolResult") {
 			results.unshift({ content: toolResultToMcpContent(msg.content), isError: msg.isError });
-		} else if (msg.role === "user") { stopIdx = i; break; }
+		} else if (msg.role === "user" || msg.role === "assistant") { stopIdx = i; break; }
 	}
-	debug(`extractAllToolResults: ${results.length} results from ${context.messages.length} msgs, stopped at user index ${stopIdx}`);
+	debug(`extractAllToolResults: ${results.length} results from ${context.messages.length} msgs, stopped at index ${stopIdx}`);
 	debug(`extractAllToolResults: all msg roles:`, context.messages.map((m, i) => `[${i}]${m.role}`).join(" "));
 	for (let r = 0; r < results.length; r++) {
 		debug(`extractAllToolResults: result[${r}]${results[r].isError ? " ERROR" : ""} preview:`, JSON.stringify(results[r].content).slice(0, 150));
@@ -715,6 +716,9 @@ function jsonSchemaToZodShape(schema: unknown): Record<string, z.ZodTypeAny> {
 
 // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
 // blocks on a Promise until pi delivers the tool result via streamSimple.
+// Matching is purely positional (FIFO) — the SDK fires handlers in tool_use
+// order and pi delivers results in the same order. The tool.name in logs is
+// the registered tool definition, not necessarily the tool the SDK is calling.
 function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	if (!tools.length) return undefined;
 	const mcpTools = tools.map((tool) => ({
@@ -722,13 +726,11 @@ function buildMcpServers(tools: Tool[]): Record<string, ReturnType<typeof create
 		description: tool.description,
 		inputSchema: jsonSchemaToZodShape(tool.parameters),
 		handler: async () => {
-			// If a result is already queued (pi delivered before SDK called us), use it.
 			if (pendingResults.length > 0) {
 				const result = pendingResults.shift()!;
 				debug(`mcp handler: ${tool.name} → resolved from queue (${pendingResults.length} remaining)`);
 				return result;
 			}
-			// Otherwise block until pi delivers the result via streamSimple.
 			debug(`mcp handler: ${tool.name} → waiting`);
 			return new Promise<McpResult>((resolve) => {
 				pendingToolCalls.push({ toolName: tool.name, resolve });
@@ -916,8 +918,8 @@ function processStreamEvent(
 		currentPiStream.end();
 		currentPiStream = null;
 
-		// Cursor is updated by the next streamSimple call (Case A/B) which sets
-		// cursor = context.messages.length with the actual post-tool-result context.
+		// Cursor is updated by the next streamSimple call (tool result delivery path)
+		// which sets cursor = context.messages.length with the post-tool-result context.
 		return;
 	}
 
@@ -1007,7 +1009,13 @@ async function consumeQuery(
 				break;
 			case "result":
 				if (!turnSawStreamEvent && message.subtype === "success") {
-					if (turnOutput) turnOutput.content.push({ type: "text", text: message.result || "" });
+					ensureTurnStarted();
+					const text = message.result || "";
+					turnBlocks.push({ type: "text", text });
+					const idx = turnBlocks.length - 1;
+					currentPiStream?.push({ type: "text_start", contentIndex: idx, partial: turnOutput });
+					currentPiStream?.push({ type: "text_delta", contentIndex: idx, delta: text, partial: turnOutput });
+					currentPiStream?.push({ type: "text_end", contentIndex: idx, content: text, partial: turnOutput });
 				}
 				break;
 			case "system":
@@ -1030,10 +1038,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const stream = createAssistantMessageEventStream();
 
 	// --- Tool result delivery ---
-	// Pi delivers all tool results in context before calling back. Extract them
-	// and match against waiting MCP handlers (pendingToolCalls). Any results that
-	// arrive before their handler get queued in pendingResults — the handler will
-	// pick them up when the SDK calls it (see buildMcpServers).
+	// Pi appends tool results to context and calls back. Extract this turn's results
+	// (everything after the last assistant message) and match against waiting MCP
+	// handlers. Results that arrive before their handler get queued in pendingResults.
 	if (activeQuery) {
 		currentPiStream = stream;
 		resetTurnState(model);
@@ -1138,9 +1145,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Background consumer — runs until query ends
 	consumeQuery(sdkQuery, customToolNameToPi, allowSkillAliasRewrite, model, () => wasAborted)
 		.then(({ capturedSessionId }) => {
-			// Update session state. Use Math.max to avoid regressing cursor: in multi-tool
-			// queries, Case A/B set cursor to the latest context.messages.length, but the
-			// `context` closure here is from the initial streamSimple call (stale).
+			// Capture the SDK session ID for future resume. The `context` closure is
+			// from the initial streamSimple call and is stale — tool result deliveries
+			// advanced sharedSession.cursor past it. We keep whichever is higher.
+			// Note: pi appends the final assistant message AFTER streamSimple returns,
+			// so cursor is always 1 behind — syncSharedSession will trigger a Case 4
+			// rebuild on the next turn. This is correct but not efficient.
 			if (!wasAborted) {
 				const sessionId = capturedSessionId ?? sharedSession?.sessionId;
 				if (sessionId) {
@@ -1418,7 +1428,7 @@ export default function (pi: ExtensionAPI) {
 					const truncated = body.length > PREVIEW_MAX_CHARS ? body.substring(0, PREVIEW_MAX_CHARS) : body;
 					const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
 					if (lines.length) text += `\n${theme.fg("toolOutput", lines.join("\n"))}`;
-					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", `… (${keyHint("app.tools.expand", "to expand")})`)}`;
+					if (body.length > PREVIEW_MAX_CHARS || body.split("\n").length > PREVIEW_MAX_LINES) text += `\n${theme.fg("dim", `… (${keyHint("expandTools", "to expand")})`)}`;
 
 				}
 

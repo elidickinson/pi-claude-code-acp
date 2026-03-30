@@ -13,9 +13,9 @@ Uses your Claude Max/Pro subscription. Only the real Claude Code touches Anthrop
 
 ## Setup
 
-1. Install (recommended: git while experimental):
+1. Install:
    ```
-   pi install git:github.com/elidickinson/pi-claude-bridge
+   pi install npm:pi-claude-bridge
    ```
 
 2. Ensure Claude Code is installed and logged in (`claude` CLI works).
@@ -65,3 +65,7 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or `.pi/claude-bridge.json` (p
 ## Debugging
 
 Set `CLAUDE_BRIDGE_DEBUG=1` to log to `~/.pi/agent/claude-bridge.log`.
+
+## Maintenance
+
+After updating Claude Code or the Agent SDK, check for new built-in tools that may need adding to `DISALLOWED_BUILTIN_TOOLS` in `index.ts`. Unrecognized CC tools leak through to pi as tool calls it can't handle. Symptoms: "Tool X not found" errors in pi.

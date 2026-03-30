@@ -219,7 +219,83 @@ await test("new query sees clean state after drain", async () => {
 	assert.equal(got.content[0].text, "q2-fresh");
 });
 
-// --- Scenario H: property-based fuzz (FUZZ=1 to enable) ---
+// --- Scenario H: extractAllToolResults must stop at assistant messages ---
+// Regression: extractAllToolResults only stopped at "user", not "assistant".
+// In a multi-turn agentic loop (user → assistant → toolResult × N → assistant → toolResult × M),
+// it collected ALL tool results from the entire conversation, not just the current turn.
+// This fed stale results into the queue, causing result/tool_use mismatches.
+
+console.log("Scenario H: extractAllToolResults boundaries");
+
+// Minimal reimplementation of extractAllToolResults for testing
+function extractAllToolResults(messages) {
+	const results = [];
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role === "toolResult") {
+			results.unshift({ content: msg.content, isError: msg.isError });
+		} else if (msg.role === "user" || msg.role === "assistant") {
+			break;
+		}
+	}
+	return results;
+}
+
+await test("single turn: collects all tool results after assistant", async () => {
+	const messages = [
+		{ role: "user", content: "prompt" },
+		{ role: "assistant", content: [{ type: "toolCall", name: "read", id: "t1" }, { type: "toolCall", name: "read", id: "t2" }] },
+		{ role: "toolResult", toolCallId: "t1", content: "file1" },
+		{ role: "toolResult", toolCallId: "t2", content: "file2" },
+	];
+	const results = extractAllToolResults(messages);
+	assert.equal(results.length, 2);
+	assert.equal(results[0].content, "file1");
+	assert.equal(results[1].content, "file2");
+});
+
+await test("multi-turn: only collects results from current turn, not previous", async () => {
+	const messages = [
+		{ role: "user", content: "prompt" },
+		{ role: "assistant", content: [{ type: "toolCall", name: "read", id: "t1" }, { type: "toolCall", name: "read", id: "t2" }] },
+		{ role: "toolResult", toolCallId: "t1", content: "file1-OLD" },
+		{ role: "toolResult", toolCallId: "t2", content: "file2-OLD" },
+		// Second turn
+		{ role: "assistant", content: [{ type: "toolCall", name: "grep", id: "t3" }] },
+		{ role: "toolResult", toolCallId: "t3", content: "grep-result-NEW" },
+	];
+	const results = extractAllToolResults(messages);
+	assert.equal(results.length, 1, `expected 1 result (current turn), got ${results.length}`);
+	assert.equal(results[0].content, "grep-result-NEW");
+});
+
+await test("three turns: only last turn's results", async () => {
+	const messages = [
+		{ role: "user", content: "prompt" },
+		{ role: "assistant", content: [{ type: "toolCall", id: "t1" }] },
+		{ role: "toolResult", toolCallId: "t1", content: "turn1" },
+		{ role: "assistant", content: [{ type: "toolCall", id: "t2" }] },
+		{ role: "toolResult", toolCallId: "t2", content: "turn2" },
+		{ role: "assistant", content: [{ type: "toolCall", id: "t3" }, { type: "toolCall", id: "t4" }] },
+		{ role: "toolResult", toolCallId: "t3", content: "turn3a" },
+		{ role: "toolResult", toolCallId: "t4", content: "turn3b" },
+	];
+	const results = extractAllToolResults(messages);
+	assert.equal(results.length, 2);
+	assert.equal(results[0].content, "turn3a");
+	assert.equal(results[1].content, "turn3b");
+});
+
+await test("no tool results at end returns empty", async () => {
+	const messages = [
+		{ role: "user", content: "prompt" },
+		{ role: "assistant", content: [{ type: "text", text: "done" }] },
+	];
+	const results = extractAllToolResults(messages);
+	assert.equal(results.length, 0);
+});
+
+// --- Scenario I: property-based fuzz (FUZZ=1 to enable) ---
 
 if (process.env.FUZZ) {
 console.log("Scenario G: fuzz (1000 random orderings)");

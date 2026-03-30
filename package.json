@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "description": "Pi extension that uses Claude Code (via Agent SDK) as a model provider and adds an AskClaude tool.",
   "keywords": [
@@ -26,7 +26,7 @@
     "screenshot.png"
   ],
   "scripts": {
-    "test": "./smoke-test.sh && ./multi-turn-test.sh && ./session-resume-test.mjs"
+    "test": "node test-queue.mjs && ./smoke-test.sh && ./multi-turn-test.sh && ./session-resume-test.mjs"
   },
   "type": "module",
   "dependencies": {
