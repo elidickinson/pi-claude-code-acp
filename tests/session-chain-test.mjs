@@ -8,11 +8,11 @@
 import { createSession, parseJsonlFile } from "cc-session-io";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { realpathSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Use this project's directory so cc-session-io and the SDK agree on path
-const projectPath = realpathSync(dirname(fileURLToPath(import.meta.url)));
+// Use the project root so cc-session-io and the SDK agree on path
+const projectPath = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
 
 // --- Step 1: Create synthetic session with 2 user/assistant turns ---
 const session = createSession({ projectPath, model: "claude-haiku-4-5-20251001" });

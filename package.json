@@ -26,7 +26,8 @@
     "screenshot.png"
   ],
   "scripts": {
-    "test": "node test-queue.mjs && ./smoke-test.sh && ./multi-turn-test.sh && ./session-resume-test.mjs"
+    "test:unit": "node tests/test-queue.mjs && node tests/test-import.mjs",
+    "test": "npm run test:unit && tests/smoke-test.sh && tests/multi-turn-test.sh && tests/session-resume-test.mjs"
   },
   "type": "module",
   "dependencies": {

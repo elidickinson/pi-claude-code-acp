@@ -1105,6 +1105,21 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		return stream;
 	}
 
+	// --- Orphaned tool result (e.g. user aborted a tool call) ---
+	// The query is gone but pi still delivered the result. Nothing to do — just
+	// emit end_turn so pi waits for the next real user message.
+	const lastMsg = context.messages[context.messages.length - 1];
+	if (lastMsg?.role === "toolResult") {
+		debug(`provider: orphaned tool result after abort, emitting end_turn`);
+		if (sharedSession) sharedSession.cursor = context.messages.length;
+		queueMicrotask(() => {
+			resetTurnState(model);
+			stream.push({ type: "done", reason: "stop", message: turnOutput });
+			stream.end();
+		});
+		return stream;
+	}
+
 	// --- Fresh query ---
 
 	// If a query is already active, a reentrant call is starting (e.g. subagent,
@@ -1135,7 +1150,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with the state stack fix — dump diagnostics if it does.
 	if (!promptText && !promptBlocks) {
-		const lastMsg = context.messages[context.messages.length - 1];
 		diagDump("empty_prompt", {
 			contextLength: context.messages.length,
 			lastMsgRole: lastMsg?.role,

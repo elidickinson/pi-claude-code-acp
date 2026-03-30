@@ -8,23 +8,29 @@
 // isolated mode (clean slate).
 //
 // Requires: pi CLI, Claude Code (for Agent SDK subprocess).
+// Requires: CLAUDE_BRIDGE_TESTING_ALT_MODEL (e.g. "openrouter/z-ai/glm-4.7-flash")
 
 console.log("=== session-resume-test.mjs ===");
 
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 
-const DIR = dirname(fileURLToPath(import.meta.url));
+if (!process.env.CLAUDE_BRIDGE_TESTING_ALT_MODEL) {
+  console.error("ERROR: CLAUDE_BRIDGE_TESTING_ALT_MODEL not set (e.g. openrouter/z-ai/glm-4.7-flash)");
+  process.exit(1);
+}
+
+const DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LOGDIR = `${DIR}/.test-output`;
 const LOGFILE = `${LOGDIR}/session-resume.log`;
 const TIMEOUT = 180_000;
 
 const BRIDGE_MODEL = "claude-bridge/claude-haiku-4-5";
-const OTHER_PROVIDER = "openrouter";
-const OTHER_MODEL = "z-ai/glm-4.7-flash";
+const [OTHER_PROVIDER, ...modelParts] = process.env.CLAUDE_BRIDGE_TESTING_ALT_MODEL.split("/");
+const OTHER_MODEL = modelParts.join("/");
 
 // Random words to avoid Claude memorizing test values across runs
 const WORD_A = `alpha${Math.random().toString(36).slice(2, 6)}`;

@@ -15,7 +15,7 @@ PATH=$(echo "$PATH" | tr ':' '\n' | grep -v node_modules | tr '\n' ':')
 TIMEOUT=180
 PASS=0
 FAIL=0
-DIR="$(cd "$(dirname "$0")" && pwd)"
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
 EXPECTED_VERSION=$(jq -r .version "$DIR/package.json")
 LOGDIR="$DIR/.test-output"
 mkdir -p "$LOGDIR"
