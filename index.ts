@@ -1092,6 +1092,9 @@ async function consumeQuery(
 		}
 	}
 
+	// DEBUG: trace when consumeQuery exits
+	debug(`consumeQuery: for-await loop exited, wasAborted=${wasAborted()}, capturedSessionId=${capturedSessionId?.slice(0, 8) ?? "none"}`);
+
 	return { capturedSessionId };
 }
 
@@ -1325,6 +1328,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					pendingResults.push(...saved.pendingResults);
 					debug(`provider: restored state (stack depth ${queryStateStack.length})`);
 				} else {
+					// DEBUG: trace when activeQuery is cleared
+					debug(`provider: clearing activeQuery (non-reentrant), pending handlers=${pendingToolCalls.length}, pendingResults=${pendingResults.length}`);
 					activeQuery = null;
 				}
 			}
