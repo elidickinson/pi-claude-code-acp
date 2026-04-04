@@ -573,7 +573,13 @@ function mapToolArgs(
 	switch (normalized) {
 		case "read": return { path: resolvePath(input.file_path ?? input.path), offset: input.offset, limit: input.limit };
 		case "write": return { path: resolvePath(input.file_path ?? input.path), content: input.content };
-		case "edit": return { path: resolvePath(input.file_path ?? input.path), oldText: input.old_string ?? input.oldText ?? input.old_text, newText: input.new_string ?? input.newText ?? input.new_text };
+		case "edit": {
+				const oldText = input.old_string ?? input.oldText ?? input.old_text;
+				const newText = input.new_string ?? input.newText ?? input.new_text;
+				const edits = Array.isArray(input.edits) ? input.edits : [];
+				if (typeof oldText === "string" && typeof newText === "string") edits.push({ oldText, newText });
+				return { path: resolvePath(input.file_path ?? input.path), edits };
+			}
 		case "bash": return { command: input.command, timeout: input.timeout ?? 120 };
 		case "grep": return { pattern: input.pattern, path: resolvePath(input.path), glob: input.glob, limit: input.head_limit ?? input.limit };
 		case "find": return { pattern: input.pattern, path: resolvePath(input.path) };
