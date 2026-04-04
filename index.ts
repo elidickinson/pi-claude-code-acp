@@ -562,29 +562,35 @@ function rewriteSkillAliasPath(pathValue: unknown): unknown {
 	return pathValue;
 }
 
-// Maps SDK tool args to pi tool args. Only known keys are forwarded per tool —
-// new SDK parameters will be silently dropped until the mapping is updated.
+// Renames for Claude Code SDK param names that differ from pi's native names.
+// Keys not listed here pass through unchanged, so new pi params work automatically.
+const SDK_KEY_RENAMES: Record<string, Record<string, string>> = {
+	read:  { file_path: "path" },
+	write: { file_path: "path" },
+	edit:  { file_path: "path", old_string: "oldText", new_string: "newText", old_text: "oldText", new_text: "newText" },
+	grep:  { head_limit: "limit" },
+};
+
+// Maps SDK tool args to pi tool args via key renaming + pass-through.
+// Pi's own prepareArguments hooks handle any structural transforms (e.g. edit oldText/newText → edits[]).
 function mapToolArgs(
 	toolName: string, args: Record<string, unknown> | undefined, allowSkillAliasRewrite = true,
 ): Record<string, unknown> {
-	const normalized = toolName.toLowerCase();
 	const input = args ?? {};
-	const resolvePath = (value: unknown) => (allowSkillAliasRewrite ? rewriteSkillAliasPath(value) : value);
-	switch (normalized) {
-		case "read": return { path: resolvePath(input.file_path ?? input.path), offset: input.offset, limit: input.limit };
-		case "write": return { path: resolvePath(input.file_path ?? input.path), content: input.content };
-		case "edit": {
-				const oldText = input.old_string ?? input.oldText ?? input.old_text;
-				const newText = input.new_string ?? input.newText ?? input.new_text;
-				const edits = Array.isArray(input.edits) ? input.edits : [];
-				if (typeof oldText === "string" && typeof newText === "string") edits.push({ oldText, newText });
-				return { path: resolvePath(input.file_path ?? input.path), edits };
-			}
-		case "bash": return { command: input.command, timeout: input.timeout ?? 120 };
-		case "grep": return { pattern: input.pattern, path: resolvePath(input.path), glob: input.glob, limit: input.head_limit ?? input.limit };
-		case "find": return { pattern: input.pattern, path: resolvePath(input.path) };
-		default: return input;
+	const renames = SDK_KEY_RENAMES[toolName.toLowerCase()];
+	const result: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(input)) {
+		const piKey = renames?.[key] ?? key;
+		if (!(piKey in result)) result[piKey] = value; // first alias wins
 	}
+	if (allowSkillAliasRewrite && typeof result.path === "string") {
+		result.path = rewriteSkillAliasPath(result.path);
+	}
+	// Pi bash has no default timeout; add a safety default
+	if (toolName.toLowerCase() === "bash" && result.timeout == null) {
+		result.timeout = 120;
+	}
+	return result;
 }
 
 // --- Provider helpers: system prompt ---
