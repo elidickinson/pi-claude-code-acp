@@ -1515,6 +1515,9 @@ const PREVIEW_MAX_LINES = 6;
 let askClaudeToolName = "AskClaude";
 
 export default function (pi: ExtensionAPI) {
+	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
+	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+
 	const config = loadConfig(process.cwd());
 	configuredMaxHistoryMessages = config.maxHistoryMessages;
 
